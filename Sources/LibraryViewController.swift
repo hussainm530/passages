@@ -17,7 +17,7 @@ final class LibraryViewController: UITableViewController {
         super.viewDidLoad()
         title = "Reading"
         tableView.rowHeight = 68
-        tableView.tableFooterView = UIView()
+        tableView.tableFooterView = buildVersionFooter()
 
         refreshControl = UIRefreshControl()
         refreshControl?.addTarget(self, action: #selector(refresh), for: .valueChanged)
@@ -27,6 +27,32 @@ final class LibraryViewController: UITableViewController {
 
         rebuildSections()
         refresh()
+    }
+
+    /// Version and server host, at the foot of the list.
+    ///
+    /// This exists because on 29 Aug 2026 a fixed build was sideloaded and
+    /// there was no way to tell it apart from the old one -- same icon, same
+    /// first screen, and nothing anywhere in the UI naming a version. "It looks
+    /// very similar" is not something the person re-signing the app should have
+    /// to resolve by testing behaviour.
+    ///
+    /// The host is here for the same reason: which laptop this build talks to
+    /// changed in that release, and it is otherwise invisible.
+    private func buildVersionFooter() -> UIView {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        let host = SyncClient.shared.baseURL.host ?? "no host"
+
+        let label = UILabel(frame: CGRect(x: 0, y: 0,
+                                          width: tableView.bounds.width, height: 44))
+        label.text = "Passages \(short) (\(build))  ·  \(host)"
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .gray
+        label.textAlignment = .center
+        label.autoresizingMask = [.flexibleWidth]
+        return label
     }
 
     /// Groups preserve the order the server sent them in, which is plan order.

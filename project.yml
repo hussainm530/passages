@@ -50,8 +50,11 @@ targets:
         # compiles but nothing points at it, which looks identical to a build
         # with no icon at all.
         XSAppIconAssets: Assets.xcassets/AppIcon.appiconset
-        CFBundleShortVersionString: "0.1"
-        CFBundleVersion: "1"
+        # Bump BOTH on every build that gets sideloaded. The library screen
+        # shows them, and that footer is the only way to tell two sideloaded
+        # builds apart -- there is no App Store version to check against.
+        CFBundleShortVersionString: "0.2"
+        CFBundleVersion: "2"
         UILaunchStoryboardName: ""
         # All four, because iPad multitasking requires either the full set or
         # UIRequiresFullScreen -- and a reader that refuses an orientation
