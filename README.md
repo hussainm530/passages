@@ -89,18 +89,24 @@ supports iOS 12 needs confirming at install time.
 
 ## Server side
 
-The app expects a small API on the ThinkPad at `100.117.163.83:8761`, extending
-`System/Scripts/reader_prototype.py`:
+The app expects a small API at `100.77.134.90:8761` — the always-on IdeaPad,
+which is where `reader_server.py` runs. It was the ThinkPad until 28 Aug 2026;
+a desk laptop that sleeps is not a reading channel.
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/library` | Queue: key, title, filename, page offset, guide, rep minutes |
-| `GET /pdf/<filename>` | The cropped PDF (already implemented, with Range support) |
+| `GET /pdf/<filename>` | The cropped PDF, with Range support |
+| `GET /api/voice` | Names of the recordings the server already holds |
 | `POST /api/annotations` | One annotation, pushed as made |
 | `POST /api/sync` | Batch of annotations + reps accumulated offline |
 | `POST /api/voice/<name>` | Voice note audio, for Moonshine transcription |
 
-**Not yet written.** Only `GET /pdf/` exists today.
+`GET /api/voice` is what makes the audio upload self-healing. The app sends
+whatever is in its `voice/` directory and missing from that list, rather than
+working out what is new from the annotation diff — which is what silently lost
+thirteen recordings, because every one of them was attached to a guide note and
+guide notes were never in the diff.
 
 ## Status
 

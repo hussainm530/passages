@@ -13,9 +13,16 @@ import Foundation
 final class SyncClient {
     static let shared = SyncClient()
 
-    /// The ThinkPad's Tailscale address. Stable, and only reachable on the
+    /// The IdeaPad's Tailscale address. Stable, and only reachable on the
     /// tailnet, which is also the only authentication this has.
-    var baseURL = URL(string: "http://100.117.163.83:8761")!
+    ///
+    /// This was the ThinkPad (`100.117.163.83`) until 28 Aug 2026. The reader
+    /// server moved to the always-on IdeaPad because a desk laptop that sleeps
+    /// is not a reading channel -- the whole point of the sub node. The app was
+    /// the last piece still pointing at the old host. `ipad_sub.py` carries
+    /// deliveries and recordings on to the ThinkPad, where Zotero, the vault
+    /// and Moonshine live.
+    var baseURL = URL(string: "http://100.77.134.90:8761")!
 
     private let session: URLSession
     private let encoder: JSONEncoder = {
@@ -150,26 +157,67 @@ final class SyncClient {
             let ok = (response as? HTTPURLResponse)?.statusCode == 200
             if ok {
                 self.lastSync = Date()
-                self.uploadVoiceNotes(pending.annotations)
+                self.reconcileVoiceNotes()
             }
             DispatchQueue.main.async { completion?(ok) }
         }.resume()
     }
 
-    /// Voice notes go up as raw audio; transcription happens on the ThinkPad
-    /// with Moonshine, which cannot run on this hardware. The recording is the
+    /// Voice notes go up as raw audio; transcription happens on the laptop with
+    /// Moonshine, which cannot run on this hardware. The recording is the
     /// annotation until then -- deliberately, so speaking a thought is never
     /// blocked on a transcription that might not be available for hours.
-    private func uploadVoiceNotes(_ annotations: [Annotation]) {
-        for annotation in annotations {
-            guard let name = annotation.voiceNote else { continue }
-            let url = Store.shared.voiceDir.appendingPathComponent(name)
-            guard let data = try? Data(contentsOf: url) else { continue }
-            var request = URLRequest(url: baseURL.appendingPathComponent("api/voice/\(name)"))
-            request.httpMethod = "POST"
-            request.setValue("audio/m4a", forHTTPHeaderField: "Content-Type")
-            session.uploadTask(with: request, from: data).resume()
+    ///
+    /// This asks the server what it already has and sends everything else. It
+    /// used to walk the unsynced annotations instead, which lost thirteen
+    /// recordings between 18 and 27 Aug 2026 in two separate ways:
+    ///
+    /// 1. **Guide notes were never considered.** `GuideNote` carries a
+    ///    `voiceNote` exactly like `Annotation` does, and in practice that is
+    ///    where the voice notes actually were -- every one of them. Speaking a
+    ///    response to a guide question is the single most natural place to use
+    ///    the microphone, and it was the one path that could not upload.
+    /// 2. **A failed upload was never retried.** The old call took the
+    ///    `unsynced(since: lastSync)` window, and `lastSync` had already moved
+    ///    by the time it ran. One dropped connection -- the laptop asleep, the
+    ///    8-second timeout -- and that recording was outside every future
+    ///    window forever.
+    ///
+    /// Reconciling against the server has no window and no notion of what a
+    /// recording is attached to, so neither failure can recur, and a backlog
+    /// that built up while the laptop was away drains on the next sync.
+    private func reconcileVoiceNotes() {
+        let fm = FileManager.default
+        let dir = Store.shared.voiceDir
+        guard let local = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+        let mine = local.filter { $0.lowercased().hasSuffix(".m4a") }
+        guard !mine.isEmpty else { return }
+
+        let task = session.dataTask(with: baseURL.appendingPathComponent("api/voice")) { data, _, _ in
+            // No listing means no upload. Sending blind would re-push the whole
+            // directory on every sync once it holds a few dozen recordings.
+            guard let data = data,
+                  let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let have = body["have"] as? [String] else { return }
+
+            let held = Set(have)
+            for name in mine where !held.contains(name) {
+                self.uploadVoiceNote(name)
+            }
         }
+        task.resume()
+    }
+
+    /// Send one recording. Deliberately not deleted afterwards: the device is
+    /// the offline-first record of truth, and the next reconcile will see the
+    /// server has it and skip it.
+    private func uploadVoiceNote(_ name: String) {
+        let url = Store.shared.voiceDir.appendingPathComponent(name)
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return }
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/voice/\(name)"))
+        request.httpMethod = "POST"
+        request.setValue("audio/m4a", forHTTPHeaderField: "Content-Type")
+        session.uploadTask(with: request, from: data).resume()
     }
 
     /// Tell the laptop this paper is (or is no longer) marked for a deep read.

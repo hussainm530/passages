@@ -66,12 +66,27 @@ targets:
         NSMicrophoneUsageDescription: >-
           Record spoken annotations while reading. Audio stays on the device
           until it syncs to your own laptop.
-        # The reader talks to the ThinkPad over Tailscale, which is plain
-        # HTTP on a private tailnet -- no public traffic, so ATS is relaxed
-        # for that host only rather than globally.
+        # The app's Documents directory holds the papers, the annotations JSON
+        # and the voice/ recordings. Exposing it costs nothing -- this is a
+        # sideloaded app on the owner's own device -- and buys a way to get at
+        # the audio from the Files app when sync is the thing that is broken.
+        # Its absence is why thirteen recordings were not merely un-uploaded
+        # but *unreachable*: on disk, intact, and invisible from the device.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        # The reader talks to a laptop over Tailscale, which is plain HTTP on a
+        # private tailnet -- no public traffic, so ATS is relaxed for those
+        # hosts only rather than globally.
+        #
+        # Both are listed. The reader moved from the ThinkPad to the always-on
+        # IdeaPad, and leaving the old host here means pointing `baseURL` back
+        # at the desk stays a one-line change rather than a rebuild-and-resign.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: false
           NSExceptionDomains:
+            100.77.134.90:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: false
             100.117.163.83:
               NSExceptionAllowsInsecureHTTPLoads: true
               NSIncludesSubdomains: false
