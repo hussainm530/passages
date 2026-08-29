@@ -220,6 +220,31 @@ final class SyncClient {
         session.uploadTask(with: request, from: data).resume()
     }
 
+    /// Send an observation about the app itself to the vault backlog.
+    ///
+    /// Not fire-and-forget, unlike everything else here. The rest of this class
+    /// can afford silent failure because the device keeps its own copy and a
+    /// later flush re-sends -- feedback has no local store and no retry, so a
+    /// dropped one is simply gone. The caller is told, and can decide.
+    ///
+    /// The server appends it under `## Open` in `_reader-app-feedback.md`, or
+    /// queues it when the serving node is not the one that owns the vault.
+    func sendFeedback(text: String, paper: String?,
+                      completion: @escaping (Bool) -> Void) {
+        guard var request = jsonRequest(path: "api/feedback") else {
+            completion(false)
+            return
+        }
+        var body: [String: Any] = ["text": text]
+        if let paper = paper, !paper.isEmpty { body["paper"] = paper }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        session.dataTask(with: request) { _, response, _ in
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            DispatchQueue.main.async { completion(code == 200) }
+        }.resume()
+    }
+
     /// Tell the laptop this paper is (or is no longer) marked for a deep read.
     ///
     /// Fire and forget, like every other write here. The checkbox has already

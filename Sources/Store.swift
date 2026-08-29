@@ -166,7 +166,13 @@ final class Store {
                 guideNotes.remove(at: i)
             } else {
                 guideNotes[i].text = text
-                if voiceNote != nil { guideNotes[i].voiceNote = voiceNote }
+                // Assign unconditionally. This used to be `if voiceNote != nil`,
+                // which made a recording permanently unremovable: nil meant
+                // "leave it alone", so there was no way to express "delete the
+                // one I attached". The composer now always passes back what it
+                // is holding -- the existing filename if untouched, nil if the
+                // reader deleted it -- so this is the honest write.
+                guideNotes[i].voiceNote = voiceNote
                 guideNotes[i].updatedAt = Date()
             }
         } else if !text.isEmpty || voiceNote != nil {
@@ -176,6 +182,36 @@ final class Store {
                 createdAt: Date(), updatedAt: Date()))
         }
         write(guideNotes, to: guideNotesFile)
+    }
+
+    // MARK: - Voice files
+
+    /// When a recording was made, read from its own filename.
+    ///
+    /// The name is `<paperKey>-<unix seconds>.m4a`, assigned at the moment
+    /// recording starts, so it is a more trustworthy timestamp than the file's
+    /// mtime -- which a copy or a restore would rewrite.
+    func voiceRecordedAt(_ name: String) -> Date? {
+        guard let dash = name.lastIndex(of: "-") else { return nil }
+        let digits = name[name.index(after: dash)...]
+            .replacingOccurrences(of: ".m4a", with: "")
+        guard let seconds = TimeInterval(digits) else { return nil }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    /// Byte size, as a cheap stand-in for "is there anything here".
+    func voiceExists(_ name: String) -> Bool {
+        return fm.fileExists(atPath: voiceDir.appendingPathComponent(name).path)
+    }
+
+    /// Remove a recording the reader has rejected.
+    ///
+    /// Deliberately deletes the file as well as the reference. The upload
+    /// reconciles the whole `voice/` directory against the server, so a file
+    /// left behind with no annotation pointing at it would still be uploaded --
+    /// and would arrive as audio nothing in the vault could file.
+    func deleteVoiceNote(_ name: String) {
+        try? fm.removeItem(at: voiceDir.appendingPathComponent(name))
     }
 
     // MARK: - Annotations

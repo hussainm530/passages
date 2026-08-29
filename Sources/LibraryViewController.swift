@@ -24,9 +24,18 @@ final class LibraryViewController: UITableViewController {
 
         navigationItem.rightBarButtonItem = UIBarButtonItem(
             title: "Sync", style: .plain, target: self, action: #selector(syncNow))
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            title: "Feedback", style: .plain, target: self, action: #selector(openFeedback))
 
         rebuildSections()
         refresh()
+    }
+
+    /// Report something about the app itself. Reachable from the list rather
+    /// than buried behind a settings screen the app does not have.
+    @objc private func openFeedback() {
+        let vc = FeedbackViewController()
+        present(UINavigationController(rootViewController: vc), animated: true)
     }
 
     /// Version and server host, at the foot of the list.

@@ -93,8 +93,14 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
                               deepIsOn: paper.deepRead ?? false)
         guideDrawer.noteProvider = { [weak self] chunk in
             guard let self = self else { return nil }
-            return Store.shared.guideNote(paperKey: self.paper.key,
-                                          step: chunk.step)?.text
+            guard let note = Store.shared.guideNote(paperKey: self.paper.key,
+                                                    step: chunk.step) else { return nil }
+            // Mark audio in the drawer too. A chunk answered only by speaking
+            // used to render as an empty note, indistinguishable from one never
+            // answered -- so the drawer said "nothing here" about a chunk that
+            // had a recording sitting against it.
+            guard note.voiceNote != nil else { return note.text }
+            return note.text.isEmpty ? "🎙 voice note" : "🎙 " + note.text
         }
         guideDrawer.onDeepChange = { [weak self] on in
             guard let self = self else { return }
@@ -142,8 +148,16 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             timerView.widthAnchor.constraint(greaterThanOrEqualToConstant: 74)
         ])
 
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            title: "Guide", style: .plain, target: self, action: #selector(toggleGuide))
+        // "Guide" stays the primary action; feedback sits beside it because
+        // this is where the app is actually being used, and an irritation
+        // reported here carries the paper it happened on. Reported from the
+        // library twenty minutes later, it arrives as "the composer is fiddly".
+        navigationItem.rightBarButtonItems = [
+            UIBarButtonItem(title: "Guide", style: .plain,
+                            target: self, action: #selector(toggleGuide)),
+            UIBarButtonItem(title: "⚑", style: .plain,
+                            target: self, action: #selector(reportIssue))
+        ]
 
         // Selection is watched rather than driven off a menu item, so the
         // composer appears the moment there is something to annotate.
@@ -159,14 +173,21 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     /// box for responses would be the thing that stops them being written.
     private func composeNote(for chunk: GuideChunk) {
         noteChunk = chunk
-        let existing = Store.shared.guideNote(paperKey: paper.key,
-                                              step: chunk.step)?.text ?? ""
+        let note = Store.shared.guideNote(paperKey: paper.key, step: chunk.step)
         composer.presentNote(chunkTitle: "\(chunk.step). \(chunk.title)",
-                             existing: existing)
+                             existing: note?.text ?? "",
+                             existingVoice: note?.voiceNote)
     }
 
     @objc private func toggleGuide() {
         guideDrawer.toggle()
+    }
+
+    /// Feedback about the app, tagged with the paper in hand.
+    @objc private func reportIssue() {
+        let vc = FeedbackViewController()
+        vc.paperContext = paper.title
+        present(UINavigationController(rootViewController: vc), animated: true)
     }
 
     // MARK: - Annotating
