@@ -247,23 +247,43 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     /// `quad_points[0]` to decide which column a highlight sits in, so element 0
     /// being the first line is load-bearing downstream.
     private func quadPoints(for selection: PDFSelection, on page: PDFPage) -> [[Double]] {
-        let lines = selection.selectionsByLine()
-            .filter { $0.pages.contains(page) }
-            .map { $0.bounds(for: page) }
+        // Written as an explicit loop rather than a filter/map/sorted chain:
+        // the chained version compiled locally in the reviewer's head and made
+        // Swift 5's type checker give up on CI with "unable to type-check this
+        // expression in reasonable time". Mixed CGFloat/Double inference across
+        // four chained closures is exactly what triggers it.
+        var lines: [CGRect] = []
+        for line in selection.selectionsByLine() {
+            guard line.pages.contains(page) else { continue }
+            let rect: CGRect = line.bounds(for: page)
             // A zero-width or zero-height rect points at nothing, and stored it
             // would still win a tie-break in the vault's placer.
-            .filter { $0.width > 0.5 && $0.height > 0.5 }
-            .sorted { a, b in
-                a.origin.y == b.origin.y ? a.origin.x < b.origin.x
-                                         : a.origin.y > b.origin.y
+            if rect.width > 0.5 && rect.height > 0.5 {
+                lines.append(rect)
             }
+        }
+
+        lines.sort { (a: CGRect, b: CGRect) -> Bool in
+            if a.origin.y == b.origin.y { return a.origin.x < b.origin.x }
+            return a.origin.y > b.origin.y
+        }
 
         // Fall back to the union rather than storing nothing. A coarse
         // rectangle still records where the passage was; an empty array loses
         // that. The text itself is captured either way.
-        let rects = lines.isEmpty ? [selection.bounds(for: page)] : lines
-        return rects.map { [Double($0.origin.x), Double($0.origin.y),
-                            Double($0.width), Double($0.height)] }
+        if lines.isEmpty {
+            lines = [selection.bounds(for: page)]
+        }
+
+        var quads: [[Double]] = []
+        for rect in lines {
+            let x = Double(rect.origin.x)
+            let y = Double(rect.origin.y)
+            let w = Double(rect.size.width)
+            let h = Double(rect.size.height)
+            quads.append([x, y, w, h])
+        }
+        return quads
     }
 
     private func saveAnnotation(comment: String,
@@ -320,8 +340,11 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             ? UIColor(red: 0.95, green: 0.75, blue: 0.3, alpha: 1)
             : UIColor(red: 0.99, green: 0.9, blue: 0.55, alpha: 1)
         for q in quads where q.count >= 4 {
-            let rect = CGRect(x: CGFloat(q[0]), y: CGFloat(q[1]),
-                              width: CGFloat(q[2]), height: CGFloat(q[3]))
+            let x: CGFloat = CGFloat(q[0])
+            let y: CGFloat = CGFloat(q[1])
+            let w: CGFloat = CGFloat(q[2])
+            let h: CGFloat = CGFloat(q[3])
+            let rect = CGRect(x: x, y: y, width: w, height: h)
             let highlight = PDFAnnotation(bounds: rect, forType: .highlight,
                                           withProperties: nil)
             highlight.color = colour
