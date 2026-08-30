@@ -141,6 +141,18 @@ struct Annotation: Codable {
     let createdAt: Date
     /// Selection rectangles in PDF page space, so the highlight can be
     /// reconstructed exactly when it is written back into the PDF.
+    ///
+    /// **One entry per line of the selection**, `[x, y, width, height]`, in
+    /// reading order — topmost line first. Until 30 Aug 2026 this was a single
+    /// union rectangle covering everything selected, which in a two-column
+    /// paper meant a two-line selection painted as a block across the whole
+    /// column.
+    ///
+    /// **PDF page space: the origin is the bottom left and y grows upward**, so
+    /// `y` is the rectangle's *bottom* edge. Any consumer laying out from the
+    /// top must flip it — `top = pageHeight - (y + height)`. The web client
+    /// tags its own records `quad_origin: "top-left"` and treats the absence of
+    /// that field as "this came from PDFKit", which is what these are.
     let quadPoints: [[Double]]
 
     enum CodingKeys: String, CodingKey {

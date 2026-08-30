@@ -138,6 +138,24 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             self.noteChunk = nil
             self.guideDrawer.refreshNotes()
         }
+        // A recording becomes part of the note the moment it stops, not when
+        // Save is pressed. Speaking the answer and walking away is the normal
+        // way to use this, and it was the one way to lose it: nothing
+        // referenced the file, so the drawer showed the chunk unanswered and
+        // the vault got audio it could not file.
+        //
+        // Inert for annotations -- `noteChunk` is nil there, and an annotation
+        // has no reopen path where a stranded recording could confuse anyone.
+        composer.onVoiceCaptured = { [weak self] name in
+            guard let self = self, let chunk = self.noteChunk else { return }
+            let existing = Store.shared.guideNote(paperKey: self.paper.key,
+                                                  step: chunk.step)
+            Store.shared.saveGuideNote(paperKey: self.paper.key, step: chunk.step,
+                                       chunkTitle: chunk.title,
+                                       text: existing?.text ?? "",
+                                       voiceNote: name)
+            self.guideDrawer.refreshNotes()
+        }
 
         timerView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(timerView)
@@ -206,6 +224,48 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     /// Order matters: the device is the record of truth. A push that fails
     /// because the ThinkPad is asleep must be invisible to the reader, and the
     /// annotation must still be there tomorrow.
+    /// The selection's geometry, one rectangle per line.
+    ///
+    /// `selection.bounds(for:)` is the *union* of everything selected, so three
+    /// words spanning two lines became a block covering both lines end to end.
+    /// In a two-column paper that block is the whole column width, which is
+    /// precisely the report: "selecting a passage grabs the whole row in that
+    /// column rather than trimming to the selected characters".
+    ///
+    /// This matters more than it looks. Capturing the *actual* selection is the
+    /// reason this app replaced GoodReader -- GoodReader stored a point-anchored
+    /// sticky note and discarded the passage, which is why 17 of 20 annotations
+    /// had to have their text inferred by hand on 9 Aug 2026. A union box is a
+    /// milder version of the same loss.
+    ///
+    /// `selectionsByLine()` is iOS 11+, so it is inside the 12.0 floor.
+    ///
+    /// Sorted into reading order rather than trusting the array's order, which
+    /// Apple does not document: top line first, then left to right. PDF page
+    /// space puts the origin at the *bottom* left and y grows upward, so the
+    /// topmost line is the one with the largest y. `zotero_annotations.py` reads
+    /// `quad_points[0]` to decide which column a highlight sits in, so element 0
+    /// being the first line is load-bearing downstream.
+    private func quadPoints(for selection: PDFSelection, on page: PDFPage) -> [[Double]] {
+        let lines = selection.selectionsByLine()
+            .filter { $0.pages.contains(page) }
+            .map { $0.bounds(for: page) }
+            // A zero-width or zero-height rect points at nothing, and stored it
+            // would still win a tie-break in the vault's placer.
+            .filter { $0.width > 0.5 && $0.height > 0.5 }
+            .sorted { a, b in
+                a.origin.y == b.origin.y ? a.origin.x < b.origin.x
+                                         : a.origin.y > b.origin.y
+            }
+
+        // Fall back to the union rather than storing nothing. A coarse
+        // rectangle still records where the passage was; an empty array loses
+        // that. The text itself is captured either way.
+        let rects = lines.isEmpty ? [selection.bounds(for: page)] : lines
+        return rects.map { [Double($0.origin.x), Double($0.origin.y),
+                            Double($0.width), Double($0.height)] }
+    }
+
     private func saveAnnotation(comment: String,
                                 category: AnnotationCategory?,
                                 voice: String?) {
@@ -215,7 +275,7 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
               let document = pdfView.document else { return }
 
         let pageIndex = document.index(for: page)
-        let bounds = selection.bounds(for: page)
+        let quads = quadPoints(for: selection, on: page)
 
         // A comment-free highlight is General, matching the rule the vault's
         // own pull already applies -- so the common case needs no interaction
@@ -231,15 +291,14 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             category: resolved,
             voiceNote: voice,
             createdAt: Date(),
-            quadPoints: [[Double(bounds.origin.x), Double(bounds.origin.y),
-                          Double(bounds.width), Double(bounds.height)]]
+            quadPoints: quads
         )
 
         Store.shared.add(annotation)
         rep.annotationCount += 1
         Store.shared.updateLatestRep { $0.annotationCount = self.rep.annotationCount }
 
-        drawHighlight(bounds: bounds, on: page, hasComment: !comment.isEmpty || voice != nil)
+        drawHighlight(quads: quads, on: page, hasComment: !comment.isEmpty || voice != nil)
         pdfView.clearSelection()
 
         // Fire and forget. No spinner, no modal, no leaving the paper --
@@ -247,15 +306,29 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         SyncClient.shared.push(annotation)
     }
 
-    private func drawHighlight(bounds: CGRect, on page: PDFPage, hasComment: Bool) {
-        let highlight = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
+    /// One `PDFAnnotation` per line, matching what was actually selected.
+    ///
+    /// A single annotation over the union rectangle is what made a two-line
+    /// selection paint as a block across the whole column. Drawing the same
+    /// rectangles that get stored also keeps the burnt-in PDF and the vault's
+    /// record of the highlight in agreement, which they were not before.
+    private func drawHighlight(quads: [[Double]], on page: PDFPage, hasComment: Bool) {
         // Colour carries no meaning -- categories come from the comment, per
         // the vault's scheme. Commented highlights are simply darker so they
         // are findable on a re-skim.
-        highlight.color = hasComment
+        let colour = hasComment
             ? UIColor(red: 0.95, green: 0.75, blue: 0.3, alpha: 1)
             : UIColor(red: 0.99, green: 0.9, blue: 0.55, alpha: 1)
-        page.addAnnotation(highlight)
+        for q in quads where q.count >= 4 {
+            let rect = CGRect(x: CGFloat(q[0]), y: CGFloat(q[1]),
+                              width: CGFloat(q[2]), height: CGFloat(q[3]))
+            let highlight = PDFAnnotation(bounds: rect, forType: .highlight,
+                                          withProperties: nil)
+            highlight.color = colour
+            page.addAnnotation(highlight)
+        }
+        // Written once, after all of them -- saving per line would rewrite the
+        // whole document for every line of a long selection.
         saveDocument()
     }
 

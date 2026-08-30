@@ -48,6 +48,16 @@ final class CommentComposer: UIView, UITextViewDelegate {
     /// deserves the one input surface that was actually designed for typing
     /// on this device.
     var onSaveNote: ((String, String?) -> Void)?
+
+    /// Fired the moment a recording stops, before any Save.
+    ///
+    /// A voice note is often the *whole* answer to a guide question -- there is
+    /// nothing to type and no reason to press Save. Persisting only on Save
+    /// meant those recordings existed on disk with nothing referencing them:
+    /// six of the nineteen recordings recovered on 29 Aug 2026 were attached to
+    /// nothing, and one of Mak's own guide notes reads "Again not sure if voice
+    /// note captured". This is what makes capture the durable moment.
+    var onVoiceCaptured: ((String) -> Void)?
     private var isNoteMode = false
 
     // MARK: - Setup
@@ -275,6 +285,9 @@ final class CommentComposer: UIView, UITextViewDelegate {
     func presentNote(chunkTitle: String, existing: String, existingVoice: String? = nil) {
         isNoteMode = true
         pendingVoiceNote = existingVoice
+        // Adopted, not made here. Re-recording may replace a take from this
+        // sitting; it may not destroy one the reader made days ago.
+        capturedThisSitting = false
         recordingLabel.isHidden = true
         quoteLabel.text = chunkTitle
         textView.text = existing
@@ -291,6 +304,7 @@ final class CommentComposer: UIView, UITextViewDelegate {
         isNoteMode = false
         chipRow.isHidden = false
         pendingVoiceNote = nil
+        capturedThisSitting = false
         recordingLabel.isHidden = true
         quoteLabel.text = "“" + quote.trimmingCharacters(in: .whitespacesAndNewlines) + "”"
         textView.text = ""
@@ -355,14 +369,28 @@ final class CommentComposer: UIView, UITextViewDelegate {
         let fresh = recorder.stop()
         stopRecordingUI()
         if let fresh = fresh {
-            // One recording per annotation. Replacing means deleting the old
-            // file, not just repointing at the new one -- the upload
-            // reconciles the whole voice/ directory, so an orphan would still
-            // be sent and would arrive as audio nothing can file.
-            if let previous = previous, previous != fresh {
+            // One recording per annotation, so a replacement deletes the old
+            // file rather than merely repointing at it -- the upload reconciles
+            // the whole voice/ directory, so an orphan would still be sent and
+            // would arrive as audio nothing can file.
+            //
+            // But only a take made in *this* sitting may be deleted. A take
+            // adopted by presentNote from an earlier session is a recording the
+            // reader made days ago and is now looking at; holding the mic to
+            // add a second thought would silently destroy it, and the intent
+            // there is to add, not to replace. Those are kept, and the note
+            // simply points at the newer one.
+            if let previous = previous, previous != fresh, capturedThisSitting {
                 Store.shared.deleteVoiceNote(previous)
             }
             pendingVoiceNote = fresh
+            capturedThisSitting = true
+            // Durable now, not at Save. Recording and then navigating away used
+            // to leave the audio on disk with nothing pointing at it -- which is
+            // how six of the nineteen recovered recordings ended up attached to
+            // nothing, and why a guide note once read "not sure if voice note
+            // captured".
+            onVoiceCaptured?(fresh)
             showMicState("✓ voice note attached", bad: false)
         } else {
             showMicState("Too short — nothing recorded", bad: true)
@@ -432,6 +460,11 @@ final class CommentComposer: UIView, UITextViewDelegate {
 
     var currentPaperKey: String = ""
     private var pendingVoiceNote: String?
+
+    /// Whether `pendingVoiceNote` was recorded during this presentation of the
+    /// composer, as opposed to adopted from a note that already had one. Only a
+    /// take from this sitting may be deleted on re-record.
+    private var capturedThisSitting = false
 
     @objc private func save() {
         let comment = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
