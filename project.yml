@@ -42,6 +42,11 @@ targets:
       # compiled in. Info.plist living under Resources/ is not the same thing
       # as Resources/ being a source.
       - path: Resources/Assets.xcassets
+      # Same trap as the asset catalogue above: a Settings.bundle that isn't
+      # listed here is committed, ignored by the build, and shows up as
+      # "Passages has no entry in Settings.app" with nothing in the log.
+      - path: Resources/Settings.bundle
+        buildPhase: resources
     info:
       path: Resources/Info.plist
       properties:
@@ -53,8 +58,8 @@ targets:
         # Bump BOTH on every build that gets sideloaded. The library screen
         # shows them, and that footer is the only way to tell two sideloaded
         # builds apart -- there is no App Store version to check against.
-        CFBundleShortVersionString: "0.3"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "0.4"
+        CFBundleVersion: "4"
         UILaunchStoryboardName: ""
         # All four, because iPad multitasking requires either the full set or
         # UIRequiresFullScreen -- and a reader that refuses an orientation
@@ -81,15 +86,18 @@ targets:
         # private tailnet -- no public traffic, so ATS is relaxed for those
         # hosts only rather than globally.
         #
-        # Both are listed. The reader moved from the ThinkPad to the always-on
-        # IdeaPad, and leaving the old host here means pointing `baseURL` back
-        # at the desk stays a one-line change rather than a rebuild-and-resign.
+        # Both nodes are listed because the server address is now selectable in
+        # Settings.app (see SyncClient.nodes). These two lists must stay in
+        # step: a node offered in Settings but missing here is selectable,
+        # reaches the network layer, and is then refused by ATS silently.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: false
           NSExceptionDomains:
+            # The always-on laptop -- the default, because it does not sleep.
             100.77.134.90:
               NSExceptionAllowsInsecureHTTPLoads: true
               NSIncludesSubdomains: false
+            # The ThinkPad -- kept as a fallback for when the server is run there.
             100.117.163.83:
               NSExceptionAllowsInsecureHTTPLoads: true
               NSIncludesSubdomains: false
