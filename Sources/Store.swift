@@ -61,6 +61,10 @@ final class Store {
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         load()
+        // Read the voice directory once at launch. This is what makes the
+        // recording indicator survive a relaunch without anything having been
+        // persisted about it: the files are the state.
+        rescanVoice()
     }
 
     // MARK: - Loading
@@ -166,7 +170,13 @@ final class Store {
                 guideNotes.remove(at: i)
             } else {
                 guideNotes[i].text = text
-                if voiceNote != nil { guideNotes[i].voiceNote = voiceNote }
+                // Assign unconditionally. This used to be `if voiceNote != nil`,
+                // which made a recording permanently unremovable: nil meant
+                // "leave it alone", so there was no way to express "delete the
+                // one I attached". The composer now always passes back what it
+                // is holding -- the existing filename if untouched, nil if the
+                // reader deleted it -- so this is the honest write.
+                guideNotes[i].voiceNote = voiceNote
                 guideNotes[i].updatedAt = Date()
             }
         } else if !text.isEmpty || voiceNote != nil {
@@ -176,6 +186,117 @@ final class Store {
                 createdAt: Date(), updatedAt: Date()))
         }
         write(guideNotes, to: guideNotesFile)
+    }
+
+    // MARK: - Voice files
+
+    /// The `voice/` directory, as of the last `rescanVoice()`.
+    ///
+    /// Held in memory because the guide drawer asks "does this chunk have a
+    /// recording" once per chunk on every rebuild, and rebuild runs on every
+    /// chunk boundary the timer crosses. One listing per mutation is cheap;
+    /// nine directory reads per tick is not.
+    private var voiceIndex: [String] = []
+
+    /// Re-read `voice/` from disk. Call after anything that adds or removes a
+    /// recording -- including `VoiceRecorder`, which deletes too-short takes
+    /// behind the Store's back.
+    ///
+    /// Zero-length files are excluded. An AVAudioRecorder interrupted at the
+    /// wrong moment leaves an empty `.m4a`, and reporting that as an
+    /// attachment would be the same lie this whole indicator exists to stop
+    /// telling.
+    func rescanVoice() {
+        let all = (try? fm.contentsOfDirectory(atPath: voiceDir.path)) ?? []
+        voiceIndex = all
+            .filter { $0.lowercased().hasSuffix(".m4a") && (voiceSize($0) ?? 0) > 0 }
+            .sorted()
+    }
+
+    /// Recordings made against one chunk of the guide, oldest first.
+    ///
+    /// The trailing hyphen in the prefix is load-bearing: without it `s1`
+    /// matches `s10` through `s19`, and step 1 would claim pass 3's audio.
+    ///
+    /// Sorting the names sorts them by time, because the epoch is fixed-width
+    /// until November 2033.
+    func voiceNotes(paperKey: String, step: Int) -> [String] {
+        let prefix = "\(paperKey)-s\(step)-"
+        return voiceIndex.filter { $0.hasPrefix(prefix) }
+    }
+
+    /// Whether a chunk has audio on disk, regardless of what any note says.
+    ///
+    /// This is the durable half of the indicator. `GuideNote.voiceNote` is
+    /// written only when the reader taps Save, so it answers "was a response
+    /// filed"; this answers "was something recorded", which is the question
+    /// actually being asked when the reader looks at the drawer and wonders
+    /// whether they spoke to a chunk already.
+    func hasVoice(paperKey: String, step: Int) -> Bool {
+        return !voiceNotes(paperKey: paperKey, step: step).isEmpty
+    }
+
+    /// When a recording was made, read from its own filename.
+    ///
+    /// The name ends `-<unix seconds>.m4a`, assigned at the moment recording
+    /// starts, so it is a more trustworthy timestamp than the file's mtime --
+    /// which a copy or a restore would rewrite.
+    func voiceRecordedAt(_ name: String) -> Date? {
+        guard let dash = name.lastIndex(of: "-") else { return nil }
+        let digits = name[name.index(after: dash)...]
+            .replacingOccurrences(of: ".m4a", with: "")
+        guard let seconds = TimeInterval(digits) else { return nil }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    /// Bytes on disk, or nil when the file is not there.
+    func voiceSize(_ name: String) -> Int? {
+        let path = voiceDir.appendingPathComponent(name).path
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              let size = attrs[.size] as? NSNumber else { return nil }
+        return size.intValue
+    }
+
+    /// Is there actually audio behind this reference?
+    func voiceExists(_ name: String) -> Bool {
+        return (voiceSize(name) ?? 0) > 0
+    }
+
+    /// Remove a recording the reader has rejected -- file *and* every reference
+    /// to it.
+    ///
+    /// Both halves matter, for different reasons. Deleting the file matters
+    /// because the upload reconciles the whole `voice/` directory against the
+    /// server, so a file left behind with nothing pointing at it would still be
+    /// sent and would arrive as audio nothing in the vault could file. Clearing
+    /// the references matters because the earlier version deleted only the
+    /// file, and a note left pointing at a deleted recording is a second way
+    /// for the indicator to lie -- this one claiming audio that no longer
+    /// exists.
+    func deleteVoiceNote(_ name: String) {
+        try? fm.removeItem(at: voiceDir.appendingPathComponent(name))
+
+        var clearedNote = false
+        for i in guideNotes.indices where guideNotes[i].voiceNote == name {
+            guideNotes[i].voiceNote = nil
+            guideNotes[i].updatedAt = Date()
+            clearedNote = true
+        }
+        if clearedNote {
+            // A note that existed only to carry the recording has nothing left
+            // to be -- the same rule saveGuideNote applies when text is cleared.
+            guideNotes.removeAll { $0.text.isEmpty && $0.voiceNote == nil }
+            write(guideNotes, to: guideNotesFile)
+        }
+
+        var clearedAnnotation = false
+        for i in annotations.indices where annotations[i].voiceNote == name {
+            annotations[i].voiceNote = nil
+            clearedAnnotation = true
+        }
+        if clearedAnnotation { write(annotations, to: annotationsFile) }
+
+        rescanVoice()
     }
 
     // MARK: - Annotations

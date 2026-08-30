@@ -35,6 +35,12 @@ final class GuideDrawer: UIView {
     /// Looks up the saved response for a chunk, so the drawer can show it
     /// without owning the store.
     var noteProvider: ((GuideChunk) -> String?)?
+    /// Whether a chunk has a recording against it. Asked separately from
+    /// `noteProvider` rather than folded into the preview string, because the
+    /// two answer different questions: one is "what did you write", the other
+    /// is "is there audio on this device". A chunk answered only by speaking
+    /// used to render exactly like one never answered.
+    var voiceProvider: ((GuideChunk) -> Bool)?
 
     /// Drawer width: wide enough for prose, narrow enough to leave a usable
     /// column of the paper visible on a 7.9" screen in portrait.
@@ -216,7 +222,8 @@ final class GuideDrawer: UIView {
                                                color: UIColor(white: 0.34, alpha: 1)))
         }
 
-        let existing = noteProvider?(chunk)
+        let existing = noteProvider?(chunk) ?? ""
+        let hasVoice = voiceProvider?(chunk) ?? false
         let b = UIButton(type: .system)
         b.tag = index
         b.titleLabel?.font = UIFont.systemFont(ofSize: 13)
@@ -225,17 +232,27 @@ final class GuideDrawer: UIView {
         b.contentEdgeInsets = UIEdgeInsets(top: 8, left: 9, bottom: 8, right: 9)
         b.layer.cornerRadius = 7
         b.heightAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
-        if let text = existing, !text.isEmpty {
+        if !existing.isEmpty || hasVoice {
             // Showing the response back is the point: a chunk you've answered
             // should look answered, so the arc doubles as a record of the read.
             // Clipped, because a long response overflowed the button instead
             // of ending -- the full text is one tap away in the composer.
-            let flat = text.replacingOccurrences(of: "\n", with: " ")
+            //
+            // The 🎙 is the persistent half. It is drawn from the audio the
+            // device actually holds, so it is still there after navigating
+            // away, after a relaunch, and after a recording that was never
+            // saved -- the three ways the old in-the-moment "✓ voice note
+            // attached" message vanished and left the reader guessing.
+            let flat = existing.replacingOccurrences(of: "\n", with: " ")
             let preview = flat.count > 140
                 ? String(flat.prefix(140)).trimmingCharacters(in: .whitespaces) + "…"
                 : flat
             b.titleLabel?.lineBreakMode = .byTruncatingTail
-            b.setTitle("🗒  " + preview, for: .normal)
+            if hasVoice && preview.isEmpty {
+                b.setTitle("🎙  Voice note recorded", for: .normal)
+            } else {
+                b.setTitle((hasVoice ? "🎙🗒  " : "🗒  ") + preview, for: .normal)
+            }
             b.setTitleColor(UIColor(white: 0.2, alpha: 1), for: .normal)
             b.backgroundColor = UIColor(red: 0.93, green: 0.95, blue: 0.93, alpha: 1)
         } else {

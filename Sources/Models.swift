@@ -139,8 +139,16 @@ struct Annotation: Codable {
     /// awaiting transcription on the laptop.
     var voiceNote: String?
     let createdAt: Date
-    /// Selection rectangles in PDF page space, so the highlight can be
-    /// reconstructed exactly when it is written back into the PDF.
+    /// One `[x, y, width, height]` per *selected line*, in PDF page space, on
+    /// the page named by `pageIndex` -- in reading order, so element 0 is the
+    /// line `text` begins on.
+    ///
+    /// This field was always plural and until 30 Aug 2026 always held exactly
+    /// one element: the union bounding box of the whole selection, which on a
+    /// multi-line selection is the full column measure and claims text that was
+    /// never selected. Records written before that date still carry that single
+    /// fat rectangle; nothing needs to migrate, because every consumer already
+    /// reads the array and the vault re-derives position from `text` anyway.
     let quadPoints: [[Double]]
 
     enum CodingKeys: String, CodingKey {

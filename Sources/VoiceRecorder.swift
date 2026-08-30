@@ -43,7 +43,12 @@ final class VoiceRecorder: NSObject {
     /// Requests permission if needed, then starts. `completion` reports whether
     /// recording actually began -- a denied microphone must not look like a
     /// silent successful recording.
-    func start(paperKey: String, completion: @escaping (Bool) -> Void) {
+    ///
+    /// `tag` is an optional anchor written into the filename -- `"s3"` for a
+    /// response to chunk 3 of the guide. See `beginRecording` for why the
+    /// filename, rather than a stored reference, is where that belongs.
+    func start(paperKey: String, tag: String? = nil,
+               completion: @escaping (Bool) -> Void) {
         let session = AVAudioSession.sharedInstance()
         session.requestRecordPermission { granted in
             DispatchQueue.main.async {
@@ -51,12 +56,14 @@ final class VoiceRecorder: NSObject {
                     completion(false)
                     return
                 }
-                completion(self.beginRecording(paperKey: paperKey, session: session))
+                completion(self.beginRecording(paperKey: paperKey, tag: tag,
+                                               session: session))
             }
         }
     }
 
-    private func beginRecording(paperKey: String, session: AVAudioSession) -> Bool {
+    private func beginRecording(paperKey: String, tag: String?,
+                                session: AVAudioSession) -> Bool {
         do {
             try session.setCategory(.playAndRecord, mode: .default)
             try session.setActive(true)
@@ -64,10 +71,28 @@ final class VoiceRecorder: NSObject {
             return false
         }
 
-        // Named by paper and timestamp so the laptop can file the transcript
-        // against the right annotation without a lookup table.
+        // Named by paper, anchor and timestamp, so the file *is* the record of
+        // what was recorded and what it answers.
+        //
+        //     <paperKey>-s<step>-<epoch>.m4a   a response to a guide chunk
+        //     <paperKey>-<epoch>.m4a           an annotation, as before
+        //
+        // The step went into the name on 30 Aug 2026 because every other way of
+        // knowing a chunk had been spoken to could drift out of step with the
+        // audio. `GuideNote.voiceNote` is written only when the reader taps
+        // Save; record and then walk away, and the .m4a is on disk with nothing
+        // pointing at it. That is not hypothetical -- it is why 19 recordings
+        // reached the vault where 13 were expected, six of them attached to
+        // nothing. A directory listing cannot drift, but only if the filename
+        // says which chunk it belongs to.
+        //
+        // Nothing on the server side parses the middle of this name:
+        // reader_server's _store_voice is name-agnostic past `.m4a`, and
+        // voice_transcribe's recorded_at takes the *last* dash-segment, which
+        // is still the epoch. Verified by reading, not by running.
         let stamp = Int(Date().timeIntervalSince1970)
-        let name = "\(paperKey)-\(stamp).m4a"
+        let suffix = tag.map { "-\($0)" } ?? ""
+        let name = "\(paperKey)\(suffix)-\(stamp).m4a"
         let url = Store.shared.voiceDir.appendingPathComponent(name)
 
         // Mono 22 kHz AAC: speech-grade, and small enough that a long offline

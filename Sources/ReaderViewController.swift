@@ -96,6 +96,21 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             return Store.shared.guideNote(paperKey: self.paper.key,
                                           step: chunk.step)?.text
         }
+        // Two sources, deliberately. The stored reference is what will be
+        // synced; the directory listing is what is true. They agree in the
+        // normal case, and when they disagree it is because a recording exists
+        // that no note has claimed -- exactly the case the reader needs told
+        // about, so the OR is the honest answer rather than a belt-and-braces.
+        guideDrawer.voiceProvider = { [weak self] chunk in
+            guard let self = self else { return false }
+            if Store.shared.hasVoice(paperKey: self.paper.key, step: chunk.step) {
+                return true
+            }
+            guard let name = Store.shared.guideNote(paperKey: self.paper.key,
+                                                    step: chunk.step)?.voiceNote
+            else { return false }
+            return Store.shared.voiceExists(name)
+        }
         guideDrawer.onDeepChange = { [weak self] on in
             guard let self = self else { return }
             self.paper.deepRead = on
@@ -132,6 +147,19 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             self.noteChunk = nil
             self.guideDrawer.refreshNotes()
         }
+        // Persist the moment audio is captured or removed, not at Save. The
+        // reader can leave the paper straight from the composer -- back to the
+        // library is one tap, and it tears the composer down without ever
+        // reaching Save. Recordings made on that path used to reach the vault
+        // with no note pointing at them. `noteChunk` is deliberately left set:
+        // this is a mid-edit write, not the end of one.
+        composer.onVoiceChange = { [weak self] text, voice in
+            guard let self = self, let chunk = self.noteChunk else { return }
+            Store.shared.saveGuideNote(paperKey: self.paper.key, step: chunk.step,
+                                       chunkTitle: chunk.title, text: text,
+                                       voiceNote: voice)
+            self.guideDrawer.refreshNotes()
+        }
 
         timerView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(timerView)
@@ -159,10 +187,11 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     /// box for responses would be the thing that stops them being written.
     private func composeNote(for chunk: GuideChunk) {
         noteChunk = chunk
-        let existing = Store.shared.guideNote(paperKey: paper.key,
-                                              step: chunk.step)?.text ?? ""
+        let note = Store.shared.guideNote(paperKey: paper.key, step: chunk.step)
         composer.presentNote(chunkTitle: "\(chunk.step). \(chunk.title)",
-                             existing: existing)
+                             step: chunk.step,
+                             existing: note?.text ?? "",
+                             existingVoice: note?.voiceNote)
     }
 
     @objc private func toggleGuide() {
@@ -171,12 +200,27 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
 
     // MARK: - Annotating
 
+    /// The selection as it stood when the composer opened.
+    ///
+    /// Held rather than re-read at Save, because `pdfView.currentSelection` is
+    /// live and the composer outlives it. A stray tap on the page clears the
+    /// selection while the composer is still up; the old code's
+    /// `guard let selection = pdfView.currentSelection` at Save then returned
+    /// early, so the annotation was dropped with no highlight, no error and no
+    /// trace. What the composer quotes is now exactly what gets written.
+    private var pendingSelection: PDFSelection?
+
     @objc private func selectionChanged() {
         guard let selection = pdfView.currentSelection,
               let text = selection.string,
               text.trimmingCharacters(in: .whitespacesAndNewlines).count > 2 else {
             return
         }
+        // Copy, because PDFKit is free to reuse the object it hands back and
+        // the geometry is not read until Save. Copying here rather than
+        // computing the line rects here keeps this notification -- which fires
+        // throughout a drag -- as cheap as it was.
+        pendingSelection = (selection.copy() as? PDFSelection) ?? selection
         composer.present(quote: text)
     }
 
@@ -188,13 +232,61 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     private func saveAnnotation(comment: String,
                                 category: AnnotationCategory?,
                                 voice: String?) {
-        guard let selection = pdfView.currentSelection,
+        guard let selection = pendingSelection ?? pdfView.currentSelection,
               let text = selection.string,
               let page = selection.pages.first,
               let document = pdfView.document else { return }
 
         let pageIndex = document.index(for: page)
-        let bounds = selection.bounds(for: page)
+
+        // Per line, not per selection.
+        //
+        // `selection.bounds(for:)` is the *union* of every glyph the selection
+        // touches on that page -- one rectangle whose left edge is the leftmost
+        // glyph of any selected line and whose right edge is the rightmost. For
+        // anything spanning more than one line that is the full column measure,
+        // so the unselected head of the first line and tail of the last were
+        // both painted and both recorded as selected. That is the "grabs the
+        // whole row in that column" report, and it is why the *geometry* was
+        // wrong while `selection.string` was right all along.
+        //
+        // `selectionsByLine()` (PDFKit, iOS 11+, so safe on the 12.0 target)
+        // returns one selection per line holding only the characters actually
+        // selected on it. `bounds(for:)` on each of those is tight to that
+        // glyph run in x, and the array of them is the staircase.
+        var rectsByPage: [Int: [CGRect]] = [:]
+        for line in selection.selectionsByLine() {
+            guard let linePage = line.pages.first else { continue }
+            let rect = line.bounds(for: linePage)
+            // PDFKit emits degenerate rects at line breaks and for the empty
+            // tail of a drag. Drawn they are invisible slivers; stored they are
+            // coordinates that point at nothing and can win a tie-break in the
+            // vault's placer.
+            guard rect.width > 0.5, rect.height > 0.5 else { continue }
+            rectsByPage[document.index(for: linePage), default: []].append(rect)
+        }
+        // If nothing usable came back, fall back to the union on the named
+        // page: the old, fat shape is worse than the staircase but far better
+        // than a record with no geometry and a highlight nobody can see.
+        if rectsByPage[pageIndex] == nil {
+            rectsByPage[pageIndex] = [selection.bounds(for: page)]
+        }
+
+        // Order is PDFKit's own, deliberately not geometric. `selection.string`
+        // and `selectionsByLine()` both follow the text stream, so element 0 is
+        // the line the quote *starts* on -- which is what the vault's
+        // `zotero_annotations.py` needs when it uses `quad_points[0]`'s x to
+        // decide which column a repeated phrase sits in. Sorting by (-y, x)
+        // would impose top-to-bottom, left-to-right order, interleave the
+        // columns of a two-column page, and decouple the first rect from the
+        // first words of `text`.
+        //
+        // Only the named page's rects are stored. A drag across a page break
+        // has geometry on both, but the record carries a single `pageIndex`;
+        // filing the tail page's coordinates under the head page's number would
+        // be actively misleading, since the placer reads them against
+        // `page_index`. The highlight itself is still drawn on every page.
+        let storedRects = rectsByPage[pageIndex] ?? []
 
         // A comment-free highlight is General, matching the rule the vault's
         // own pull already applies -- so the common case needs no interaction
@@ -210,15 +302,19 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             category: resolved,
             voiceNote: voice,
             createdAt: Date(),
-            quadPoints: [[Double(bounds.origin.x), Double(bounds.origin.y),
-                          Double(bounds.width), Double(bounds.height)]]
+            quadPoints: storedRects.map {
+                [Double($0.origin.x), Double($0.origin.y),
+                 Double($0.width), Double($0.height)]
+            }
         )
 
         Store.shared.add(annotation)
         rep.annotationCount += 1
         Store.shared.updateLatestRep { $0.annotationCount = self.rep.annotationCount }
 
-        drawHighlight(bounds: bounds, on: page, hasComment: !comment.isEmpty || voice != nil)
+        drawHighlight(rectsByPage: rectsByPage, in: document,
+                      hasComment: !comment.isEmpty || voice != nil)
+        pendingSelection = nil
         pdfView.clearSelection()
 
         // Fire and forget. No spinner, no modal, no leaving the paper --
@@ -226,15 +322,40 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         SyncClient.shared.push(annotation)
     }
 
-    private func drawHighlight(bounds: CGRect, on page: PDFPage, hasComment: Bool) {
-        let highlight = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
+    /// One `PDFAnnotation` per line rect.
+    ///
+    /// PDFKit synthesises a highlight's QuadPoints from its `bounds`, so a
+    /// single annotation can only ever paint a single rectangle -- which is the
+    /// other half of the whole-row bug. N annotations is how the staircase gets
+    /// into the file on disk.
+    ///
+    /// `PDFAnnotation.quadrilateralPoints` would carry the staircase on one
+    /// annotation and is also iOS 11+, but its coordinate space (page-relative
+    /// vs. annotation-bounds-relative) has differed across PDFKit versions and
+    /// there is no Mac in this setup to settle which one iOS 12 wants. Getting
+    /// it wrong renders the highlight in the wrong place rather than failing to
+    /// build, so it is not worth the trade here.
+    private func drawHighlight(rectsByPage: [Int: [CGRect]],
+                               in document: PDFDocument,
+                               hasComment: Bool) {
         // Colour carries no meaning -- categories come from the comment, per
         // the vault's scheme. Commented highlights are simply darker so they
         // are findable on a re-skim.
-        highlight.color = hasComment
+        let color = hasComment
             ? UIColor(red: 0.95, green: 0.75, blue: 0.3, alpha: 1)
             : UIColor(red: 0.99, green: 0.9, blue: 0.55, alpha: 1)
-        page.addAnnotation(highlight)
+        for (index, rects) in rectsByPage {
+            guard let page = document.page(at: index) else { continue }
+            for rect in rects {
+                let highlight = PDFAnnotation(bounds: rect, forType: .highlight,
+                                              withProperties: nil)
+                highlight.color = color
+                page.addAnnotation(highlight)
+            }
+        }
+        // Once, after the whole staircase. `saveDocument()` is a full
+        // `document.write(to:)`; left inside the loop, a five-line highlight
+        // would rewrite the entire PDF five times on an A7.
         saveDocument()
     }
 

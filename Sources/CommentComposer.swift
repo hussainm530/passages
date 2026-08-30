@@ -26,6 +26,12 @@ final class CommentComposer: UIView, UITextViewDelegate {
     private let saveButton = UIButton(type: .system)
     private let recordingLabel = UILabel()
 
+    private let voiceChip = UIView()
+    private let voiceChipLabel = UILabel()
+    private let voiceDeleteButton = UIButton(type: .system)
+    private lazy var voiceChipHeight: NSLayoutConstraint =
+        voiceChip.heightAnchor.constraint(equalToConstant: 0)
+
     private let recorder = VoiceRecorder()
     private var recordingTimer: Timer?
 
@@ -42,7 +48,21 @@ final class CommentComposer: UIView, UITextViewDelegate {
     /// deserves the one input surface that was actually designed for typing
     /// on this device.
     var onSaveNote: ((String, String?) -> Void)?
+
+    /// Fired the moment the attached recording changes in note mode, with the
+    /// text currently typed and the filename now attached (nil if deleted).
+    ///
+    /// This exists so the response is written the *instant* the audio exists,
+    /// not when Save is tapped. The gap between those two is where recordings
+    /// were being lost: the reader holds to speak, then navigates back to the
+    /// library, which tears down this whole view -- `dismiss()` never runs, and
+    /// `pendingVoiceNote` dies with it. The .m4a is still on disk and still
+    /// gets uploaded, so the audio arrives in the vault attached to nothing.
+    var onVoiceChange: ((String, String?) -> Void)?
+
     private var isNoteMode = false
+    /// Which guide chunk is being answered, for the recording's filename.
+    private var noteStep: Int?
 
     // MARK: - Setup
 
@@ -88,6 +108,29 @@ final class CommentComposer: UIView, UITextViewDelegate {
         textView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(textView)
 
+        // The attached-recording row. Collapsed to zero height when there is
+        // nothing attached, so the composer is unchanged in the common case.
+        voiceChip.backgroundColor = UIColor(red: 0.93, green: 0.95, blue: 0.93, alpha: 1)
+        voiceChip.layer.cornerRadius = 6
+        voiceChip.layer.borderWidth = 1
+        voiceChip.layer.borderColor = UIColor(red: 0.72, green: 0.80, blue: 0.74, alpha: 1).cgColor
+        voiceChip.clipsToBounds = true
+        voiceChip.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(voiceChip)
+
+        voiceChipLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        voiceChipLabel.textColor = UIColor(red: 0.18, green: 0.36, blue: 0.24, alpha: 1)
+        voiceChipLabel.translatesAutoresizingMaskIntoConstraints = false
+        voiceChip.addSubview(voiceChipLabel)
+
+        voiceDeleteButton.setTitle("Delete", for: .normal)
+        voiceDeleteButton.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .medium)
+        voiceDeleteButton.setTitleColor(UIColor(red: 0.7, green: 0.2, blue: 0.15, alpha: 1),
+                                        for: .normal)
+        voiceDeleteButton.translatesAutoresizingMaskIntoConstraints = false
+        voiceDeleteButton.addTarget(self, action: #selector(deleteVoice), for: .touchUpInside)
+        voiceChip.addSubview(voiceDeleteButton)
+
         micButton.setTitle("🎤  Hold to speak", for: .normal)
         micButton.titleLabel?.font = UIFont.systemFont(ofSize: 14)
         micButton.translatesAutoresizingMaskIntoConstraints = false
@@ -125,7 +168,19 @@ final class CommentComposer: UIView, UITextViewDelegate {
             textView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             textView.heightAnchor.constraint(equalToConstant: 78),
 
-            micButton.topAnchor.constraint(equalTo: textView.bottomAnchor, constant: 8),
+            voiceChip.topAnchor.constraint(equalTo: textView.bottomAnchor, constant: 8),
+            voiceChip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            voiceChip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            voiceChipHeight,
+
+            voiceChipLabel.leadingAnchor.constraint(equalTo: voiceChip.leadingAnchor,
+                                                    constant: 10),
+            voiceChipLabel.centerYAnchor.constraint(equalTo: voiceChip.centerYAnchor),
+            voiceDeleteButton.trailingAnchor.constraint(equalTo: voiceChip.trailingAnchor,
+                                                        constant: -10),
+            voiceDeleteButton.centerYAnchor.constraint(equalTo: voiceChip.centerYAnchor),
+
+            micButton.topAnchor.constraint(equalTo: voiceChip.bottomAnchor, constant: 8),
             micButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             micButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
 
@@ -225,14 +280,29 @@ final class CommentComposer: UIView, UITextViewDelegate {
     /// Open for a guide-chunk response. Category chips are hidden: a note
     /// about a step of the method has no category to pick, and leaving a
     /// meaningless row of chips on screen invites a meaningless tap.
-    func presentNote(chunkTitle: String, existing: String) {
+    ///
+    /// `existingVoice` is what makes reopening honest. Until 30 Aug 2026 this
+    /// reset the voice state to nil on every open, so a note with a recording
+    /// attached looked identical to one without: the reader saw "voice note
+    /// attached", navigated away, came back, and had no way to tell whether
+    /// anything had been captured -- or to remove a bad take.
+    func presentNote(chunkTitle: String, step: Int, existing: String,
+                     existingVoice: String? = nil) {
         isNoteMode = true
-        pendingVoiceNote = nil
+        noteStep = step
+        // Disk beats the stored reference. A recording made and then abandoned
+        // without tapping Save leaves an .m4a with nothing pointing at it;
+        // adopting the newest one for this chunk is what lets the composer tell
+        // the truth about what is actually on the device, rather than only
+        // about what was filed.
+        pendingVoiceNote = existingVoice
+            ?? Store.shared.voiceNotes(paperKey: currentPaperKey, step: step).last
         recordingLabel.isHidden = true
         quoteLabel.text = chunkTitle
         textView.text = existing
         selectedCategory = nil
         chipRow.isHidden = true
+        refreshVoiceChip()
         isHidden = false
         // Unlike an annotation, a note has nothing to save without typing --
         // so here the keyboard *is* raised.
@@ -241,6 +311,7 @@ final class CommentComposer: UIView, UITextViewDelegate {
 
     func present(quote: String) {
         isNoteMode = false
+        noteStep = nil
         chipRow.isHidden = false
         pendingVoiceNote = nil
         recordingLabel.isHidden = true
@@ -248,6 +319,7 @@ final class CommentComposer: UIView, UITextViewDelegate {
         textView.text = ""
         selectedCategory = nil
         refreshChips()
+        refreshVoiceChip()
         isHidden = false
         // Note: the keyboard is *not* raised automatically. Most annotations
         // are a chip tap or a voice note, and forcing the keyboard up would
@@ -256,7 +328,10 @@ final class CommentComposer: UIView, UITextViewDelegate {
 
     func dismiss() {
         textView.resignFirstResponder()
+        // cancel() removes an in-progress recording's file directly, so the
+        // Store's listing has to be told. Harmless when nothing was running.
         recorder.cancel()
+        Store.shared.rescanVoice()
         stopRecordingUI()
         isHidden = true
     }
@@ -275,7 +350,12 @@ final class CommentComposer: UIView, UITextViewDelegate {
                          bad: true)
             return
         }
-        recorder.start(paperKey: currentPaperKey) { started in
+        // In note mode the chunk goes into the filename, so a directory listing
+        // can answer "has this chunk been spoken to" without consulting
+        // anything that has to be kept in step.
+        var tag: String?
+        if isNoteMode, let step = noteStep { tag = "s\(step)" }
+        recorder.start(paperKey: currentPaperKey, tag: tag) { started in
             guard started else {
                 self.showMicState("Couldn't start recording", bad: true)
                 return
@@ -302,13 +382,87 @@ final class CommentComposer: UIView, UITextViewDelegate {
             }
             return
         }
-        pendingVoiceNote = recorder.stop()
+        let previous = pendingVoiceNote
+        let fresh = recorder.stop()
         stopRecordingUI()
-        if pendingVoiceNote != nil {
+        // stop() deletes a too-short take behind the Store's back, so the
+        // in-memory listing has to be re-read either way.
+        Store.shared.rescanVoice()
+
+        if let fresh = fresh {
+            // One recording per response. Replacing means deleting the old file,
+            // not just repointing at the new one -- the upload reconciles the
+            // whole voice/ directory, so an orphan would still be sent and
+            // would arrive as audio nothing can file.
+            if let previous = previous, previous != fresh {
+                Store.shared.deleteVoiceNote(previous)
+            }
+            pendingVoiceNote = fresh
             showMicState("✓ voice note attached", bad: false)
         } else {
             showMicState("Too short — nothing recorded", bad: true)
         }
+        refreshVoiceChip()
+        publishVoiceChange()
+    }
+
+    /// Write the recording against the chunk immediately, rather than at Save.
+    ///
+    /// See `onVoiceChange`. Save is not a reliable moment to persist audio:
+    /// the reader can leave the paper straight from the composer, and nothing
+    /// on that path runs. Persisting on capture closes the window entirely --
+    /// the reference exists as soon as the file does.
+    private func publishVoiceChange() {
+        guard isNoteMode else { return }
+        onVoiceChange?(textView.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                       pendingVoiceNote)
+    }
+
+    /// Show what is actually attached, every time the composer opens.
+    ///
+    /// The old behaviour reported capture only in the moment -- "✓ voice note
+    /// attached" -- and that message was gone on reopen. A recording you cannot
+    /// see is one you cannot trust or correct, which is how a reader ends up
+    /// writing "Again not sure if voice note captured" in a guide note.
+    private func refreshVoiceChip() {
+        guard let name = pendingVoiceNote else {
+            voiceChipHeight.constant = 0
+            voiceChip.isHidden = true
+            return
+        }
+        voiceChip.isHidden = false
+        voiceChipHeight.constant = 34
+
+        var parts = ["🎙 voice note"]
+        if let at = Store.shared.voiceRecordedAt(name) {
+            let f = DateFormatter()
+            f.dateFormat = "d MMM, HH:mm"
+            parts.append(f.string(from: at))
+        }
+        // Size, not just presence. A recorder interrupted at the wrong moment
+        // leaves a zero-length .m4a, and "attached" over an empty file is the
+        // failure this indicator was built to stop.
+        if let bytes = Store.shared.voiceSize(name), bytes > 0 {
+            parts.append("\(max(1, bytes / 1024)) KB")
+        } else {
+            parts.append("FILE MISSING")
+        }
+        voiceChipLabel.text = parts.joined(separator: "  ·  ")
+    }
+
+    /// Remove the attached recording, file and reference together.
+    ///
+    /// No confirmation dialog: the reader is deleting a take they just judged
+    /// bad, usually to record another immediately, and a modal in that loop is
+    /// friction with nothing to show for it. The next recording is one hold
+    /// away, which is the real undo.
+    @objc private func deleteVoice() {
+        guard let name = pendingVoiceNote else { return }
+        Store.shared.deleteVoiceNote(name)
+        pendingVoiceNote = nil
+        refreshVoiceChip()
+        publishVoiceChange()
+        showMicState("Recording deleted", bad: false)
     }
 
     /// One place that reports capture state, so it can never be ambiguous.
@@ -341,6 +495,7 @@ final class CommentComposer: UIView, UITextViewDelegate {
         }
         pendingVoiceNote = nil
         recordingLabel.isHidden = true
+        refreshVoiceChip()
         dismiss()
     }
 
