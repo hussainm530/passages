@@ -86,7 +86,10 @@ final class SyncClient {
         let task = session.dataTask(with: baseURL.appendingPathComponent("api/library")) { data, _, _ in
             guard let data = data,
                   let papers = try? self.decoder.decode([Paper].self, from: data) else {
-                completion(nil)
+                // Main thread on this path too. Callers reload the table view
+                // from this completion, and off-main UIKit is undefined
+                // behaviour -- it just happens to survive most of the time.
+                DispatchQueue.main.async { completion(nil) }
                 return
             }
             DispatchQueue.main.async {
@@ -289,25 +292,110 @@ final class SyncClient {
         session.dataTask(with: request).resume()
     }
 
-    /// Report a read/unread mark. Fire and forget, like every other write.
+    /// Report a read/unread mark. Queued if it does not land.
     func setRead(_ paper: Paper, _ read: Bool) {
-        guard var request = jsonRequest(path: "api/read") else { return }
-        request.httpBody = try? JSONSerialization.data(
-            withJSONObject: ["paper_key": paper.key, "title": paper.title,
-                             "read": read])
-        session.dataTask(with: request).resume()
+        post(path: "api/read",
+             body: ["paper_key": paper.key, "title": paper.title, "read": read])
     }
 
     /// Tell the laptop a paper left the device, with what it has to show for
     /// itself, so the vault side can ask about an offload that captured
     /// nothing rather than assuming the read happened.
     func reportOffload(_ paper: Paper, annotations: Int, guideNotes: Int) {
-        guard var request = jsonRequest(path: "api/offload") else { return }
-        request.httpBody = try? JSONSerialization.data(
-            withJSONObject: ["paper_key": paper.key, "title": paper.title,
-                             "annotation_count": annotations,
-                             "guide_note_count": guideNotes])
-        session.dataTask(with: request).resume()
+        post(path: "api/offload",
+             body: ["paper_key": paper.key, "title": paper.title,
+                    "annotation_count": annotations,
+                    "guide_note_count": guideNotes])
+    }
+
+    // MARK: - Unsent writes
+
+    /// `api/read` and `api/offload` used to be fire-and-forget: no completion
+    /// handler, no retry, an 8-second timeout, and `waitsForConnectivity` off.
+    /// Nothing else carries their news either -- `SyncPayload` is exactly
+    /// {annotations, reps, guide_notes} -- so a POST issued while the laptop was
+    /// asleep was gone for good, and silently. That is what happened between
+    /// 18 Aug and 2 Sept 2026: every offload mark made on this device was lost,
+    /// `offloads.json` was never created on *either* node, and no surface said
+    /// so. The tap looked like it worked, because locally it had.
+    ///
+    /// So a write that does not land is kept on disk and retried on the next
+    /// sync. Reads and offloads are small, idempotent, and keyed by paper --
+    /// re-sending one is free, and losing one costs a question nobody can
+    /// reconstruct later.
+
+    private let pendingQueue = DispatchQueue(label: "app.passages.pending-writes")
+
+    private var pendingFile: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory,
+                                           in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir,
+                                                 withIntermediateDirectories: true)
+        return dir.appendingPathComponent("pending-writes.json")
+    }
+
+    /// One pending write per (path, paper). Tapping offload twice is one claim
+    /// on the server, so it should not be two rows here either.
+    private func mutatePending(_ change: (inout [[String: Any]]) -> Void) {
+        pendingQueue.sync {
+            var items: [[String: Any]] = []
+            if let data = try? Data(contentsOf: pendingFile),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                items = arr
+            }
+            change(&items)
+            if let data = try? JSONSerialization.data(withJSONObject: items) {
+                try? data.write(to: pendingFile, options: .atomic)
+            }
+        }
+    }
+
+    private static func matches(_ item: [String: Any],
+                                _ path: String, _ paperKey: String) -> Bool {
+        let body = item["body"] as? [String: Any]
+        return (item["path"] as? String) == path
+            && (body?["paper_key"] as? String) == paperKey
+    }
+
+    /// Send a write, and keep it if it does not arrive.
+    private func post(path: String, body: [String: Any]) {
+        guard var request = jsonRequest(path: path) else { return }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        let paperKey = (body["paper_key"] as? String) ?? ""
+        session.dataTask(with: request) { [weak self] _, response, error in
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let landed = error == nil && (200..<300).contains(code)
+            // A 4xx is the server refusing the write, not the network dropping
+            // it. Retrying that forever would be a poison pill, so only a
+            // transport failure or a 5xx is worth keeping.
+            let worthRetrying = error != nil || code >= 500 || code == 0
+            self?.mutatePending { items in
+                items.removeAll { SyncClient.matches($0, path, paperKey) }
+                if !landed && worthRetrying {
+                    items.append(["path": path, "body": body])
+                }
+            }
+        }.resume()
+    }
+
+    /// Drain the queue. Safe to call whenever -- each write re-queues itself if
+    /// it fails again, and succeeds idempotently if the first attempt actually
+    /// did arrive.
+    func retryPendingWrites() {
+        var items: [[String: Any]] = []
+        mutatePending { items = $0 }
+        for item in items {
+            guard let path = item["path"] as? String,
+                  let body = item["body"] as? [String: Any] else { continue }
+            post(path: path, body: body)
+        }
+    }
+
+    /// How many writes are waiting. For the sync button's label.
+    var pendingWriteCount: Int {
+        var count = 0
+        mutatePending { count = $0.count }
+        return count
     }
 
     private func jsonRequest(path: String) -> URLRequest? {

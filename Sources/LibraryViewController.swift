@@ -85,6 +85,10 @@ final class LibraryViewController: UITableViewController {
     // MARK: - Sync
 
     @objc private func refresh() {
+        // Launch and pull-to-refresh both land here, which makes it the other
+        // natural moment to drain writes that never made it out.
+        SyncClient.shared.retryPendingWrites()
+
         SyncClient.shared.fetchLibrary { [weak self] papers in
             guard let self = self else { return }
             self.refreshControl?.endRefreshing()
@@ -97,9 +101,26 @@ final class LibraryViewController: UITableViewController {
     }
 
     @objc private func syncNow() {
+        // Anything that failed to send earlier goes first -- an offload marked
+        // while the laptop was asleep is the whole reason this queue exists.
+        SyncClient.shared.retryPendingWrites()
+
         SyncClient.shared.flush { [weak self] ok in
-            self?.navigationItem.rightBarButtonItem?.title = ok ? "Synced" : "Offline"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            guard let self = self else { return }
+            self.navigationItem.rightBarButtonItem?.title = ok ? "Synced" : "Offline"
+
+            // Then refetch the library. Sync used to only push, so a paper
+            // offloaded on this device stayed on the list until you pulled to
+            // refresh or relaunched -- it read as "I offloaded it and sync did
+            // nothing". The server drops an offloaded paper from /api/library,
+            // so one fetch is all it takes for the row to go.
+            SyncClient.shared.fetchLibrary { [weak self] _ in
+                guard let self = self else { return }
+                self.rebuildSections()
+                self.tableView.reloadData()
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 self?.navigationItem.rightBarButtonItem?.title = "Sync"
             }
         }
