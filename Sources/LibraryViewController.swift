@@ -13,6 +13,17 @@ final class LibraryViewController: UITableViewController {
     private var sections: [(String, [Paper])] = []
     private var downloading = Set<String>()
 
+    /// The footer, kept so its text can be rewritten after every fetch.
+    ///
+    /// It used to be built once and forgotten, which is why a failed refresh
+    /// was invisible: `refresh()` discarded its result with `_ = papers` on the
+    /// grounds that offline is normal. Offline *is* normal -- but showing a
+    /// list without saying it is stale is not the same thing as handling it.
+    private weak var statusLabel: UILabel?
+
+    /// When the list on screen was last confirmed against the server.
+    private var lastGoodFetch: Date?
+
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "Reading"
@@ -57,11 +68,49 @@ final class LibraryViewController: UITableViewController {
         let label = UILabel(frame: CGRect(x: 0, y: 0,
                                           width: tableView.bounds.width, height: 44))
         label.text = "Passages \(short) (\(build))  ·  \(host)"
+        label.numberOfLines = 2
         label.font = .systemFont(ofSize: 12)
         label.textColor = .gray
         label.textAlignment = .center
         label.autoresizingMask = [.flexibleWidth]
+        statusLabel = label
         return label
+    }
+
+    /// Rewrite the footer to say whether the list on screen is current.
+    ///
+    /// Deliberately the footer and not an alert: a modal would have to be
+    /// dismissed every time the iPad is out of Tailscale range, which is most
+    /// of the time and entirely fine. The list still works offline. What was
+    /// missing was any way to tell "the server has nothing new" apart from
+    /// "the app never reached the server" -- on 7 Sept that cost an hour of
+    /// looking for a bug in the ordering code, which was working, while the
+    /// iPad had simply dropped off the tailnet after a reboot.
+    private func updateStatus(reachedServer: Bool) {
+        guard let label = statusLabel else { return }
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        let host = SyncClient.shared.baseURL.host ?? "no host"
+        let head = "Passages \(short) (\(build))  ·  \(host)"
+
+        if reachedServer {
+            lastGoodFetch = Date()
+            label.textColor = .gray
+            label.text = head + "\nUp to date"
+            return
+        }
+
+        // Amber rather than red: nothing is broken, the list is just old.
+        label.textColor = UIColor(red: 0.72, green: 0.45, blue: 0.0, alpha: 1)
+        if let when = lastGoodFetch {
+            let f = DateFormatter()
+            f.dateStyle = .none
+            f.timeStyle = .short
+            label.text = head + "\nCan't reach \(host) — list is from \(f.string(from: when))"
+        } else {
+            label.text = head + "\nCan't reach \(host) — showing the saved list"
+        }
     }
 
     /// Groups preserve the order the server sent them in, which is plan order.
@@ -94,9 +143,9 @@ final class LibraryViewController: UITableViewController {
             self.refreshControl?.endRefreshing()
             self.rebuildSections()
             self.tableView.reloadData()
-            // Offline is normal, not an error. The queue on disk still works,
-            // so say nothing and carry on.
-            _ = papers
+            // Offline is normal, not an error -- but it is not silent either.
+            // A pull-to-refresh that changes nothing should say why.
+            self.updateStatus(reachedServer: papers != nil)
         }
     }
 
@@ -114,10 +163,11 @@ final class LibraryViewController: UITableViewController {
             // refresh or relaunched -- it read as "I offloaded it and sync did
             // nothing". The server drops an offloaded paper from /api/library,
             // so one fetch is all it takes for the row to go.
-            SyncClient.shared.fetchLibrary { [weak self] _ in
+            SyncClient.shared.fetchLibrary { [weak self] papers in
                 guard let self = self else { return }
                 self.rebuildSections()
                 self.tableView.reloadData()
+                self.updateStatus(reachedServer: papers != nil)
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
