@@ -18,6 +18,17 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     /// The chunk whose response is being written, if any.
     private var noteChunk: GuideChunk?
 
+    /// Where you are in the document, as a quantity rather than a number --
+    /// the same argument as the chunk timer. Sits along the bottom edge.
+    private let progressBar = UIProgressView(progressViewStyle: .bar)
+    private let pageLabel = UILabel()
+    private var bookmarkButton: UIBarButtonItem!
+    /// Restoring the saved page has to wait until the PDFView has a size;
+    /// `go(to:)` in `viewDidLoad` runs against a zero-height view and scrolls
+    /// nowhere, which is why "it never remembers my page" was reported as a
+    /// missing bookmark. Done once, on the first real layout.
+    private var restoredPosition = false
+
     init(paper: Paper) {
         self.paper = paper
         self.rep = Rep(paperKey: paper.key, startedAt: Date(),
@@ -41,6 +52,10 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         // The timer starts on open rather than on a button, because a rep you
         // have to remember to start is a rep that goes untimed.
         timerView.target = paper.repMinutes.map { TimeInterval($0 * 60) }
+        // ...and it continues from where the last sitting left this paper.
+        // The plan's minutes are a budget for the document; a 60-minute read
+        // done over three evenings is one read, not three that never finish.
+        timerView.carried = Store.shared.priorElapsed(for: paper.key)
         timerView.onTargetReached = { [weak self] in self?.announceTarget() }
         // The bar is driven off the same clock as the digits rather than its
         // own timer, so the two can never disagree about how long you've read.
@@ -51,8 +66,23 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             let all = self.guideDrawer.activeChunks
             self.guideDrawer.setCurrentStep(
                 i.flatMap { $0 < all.count ? all[$0].step : nil })
+            // Persist this sitting's count as it grows, not only at the end.
+            // A rep that ends with the battery dying used to leave `endedAt`
+            // nil and contribute nothing to the next sitting's clock.
+            let seconds = self.timerView.sessionElapsed
+            if Int(seconds) % 30 == 0 {
+                Store.shared.updateLatestRep { $0.elapsedSeconds = seconds }
+            }
         }
         timerView.start()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        guard !restoredPosition, pdfView.bounds.height > 0,
+              pdfView.document != nil else { return }
+        restoredPosition = true
+        restorePosition()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -79,10 +109,66 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         if let document = PDFDocument(url: url) {
             pdfView.document = document
             restoreExistingAnnotations(into: document)
-            restorePosition()
+            // Position is restored in viewDidLayoutSubviews, once the view
+            // has a height to scroll within.
         } else {
             showMissingFile()
         }
+
+        // Page position along the bottom. Thin, and under the PDF's own
+        // scroll indicator, so it reads as part of the page rather than as
+        // chrome to be looked at.
+        progressBar.progressTintColor = UIColor(red: 0.54, green: 0.35, blue: 0.17, alpha: 0.85)
+        progressBar.trackTintColor = UIColor(white: 0, alpha: 0.08)
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(progressBar)
+
+        pageLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        pageLabel.textColor = UIColor(white: 0.35, alpha: 1)
+        pageLabel.backgroundColor = UIColor(white: 1, alpha: 0.85)
+        pageLabel.layer.cornerRadius = 8
+        pageLabel.clipsToBounds = true
+        pageLabel.textAlignment = .center
+        pageLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(pageLabel)
+
+        NSLayoutConstraint.activate([
+            progressBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            progressBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            progressBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            progressBar.heightAnchor.constraint(equalToConstant: 3),
+
+            pageLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            pageLabel.bottomAnchor.constraint(equalTo: progressBar.topAnchor, constant: -4),
+            pageLabel.heightAnchor.constraint(equalToConstant: 18),
+            pageLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 64)
+        ])
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(pageChanged),
+            name: .PDFViewPageChanged, object: pdfView)
+        pageChanged()
+    }
+
+    /// Keep the bar, the label and the saved position in step with the page.
+    @objc private func pageChanged() {
+        guard let document = pdfView.document, document.pageCount > 0,
+              let page = pdfView.currentPage else {
+            progressBar.progress = 0
+            pageLabel.text = nil
+            return
+        }
+        let index = document.index(for: page)
+        let count = document.pageCount
+        progressBar.setProgress(Float(index + 1) / Float(count), animated: false)
+        pageLabel.text = "  \(index + 1) / \(count)  "
+        // Not before the saved position has been restored: the first page
+        // change fires at page one while the document loads, and writing that
+        // would overwrite the very position about to be read back.
+        if restoredPosition {
+            Store.shared.setProgress(paper.key, page: index, pageCount: count)
+        }
+        refreshBookmarkButton()
     }
 
     private func setUpChrome() {
@@ -170,12 +256,18 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         // this is where the app is actually being used, and an irritation
         // reported here carries the paper it happened on. Reported from the
         // library twenty minutes later, it arrives as "the composer is fiddly".
+        bookmarkButton = UIBarButtonItem(title: "🔖", style: .plain,
+                                         target: self, action: #selector(bookmarkTapped))
         navigationItem.rightBarButtonItems = [
             UIBarButtonItem(title: "Guide", style: .plain,
                             target: self, action: #selector(toggleGuide)),
+            UIBarButtonItem(title: "☰", style: .plain,
+                            target: self, action: #selector(showContents)),
+            bookmarkButton,
             UIBarButtonItem(title: "⚑", style: .plain,
                             target: self, action: #selector(reportIssue))
         ]
+        refreshBookmarkButton()
 
         // Selection is watched rather than driven off a menu item, so the
         // composer appears the moment there is something to annotate.
@@ -199,6 +291,87 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
 
     @objc private func toggleGuide() {
         guideDrawer.toggle()
+    }
+
+    // MARK: - Contents and bookmark
+
+    /// The PDF's outline, for the textbooks. Papers mostly have none, and
+    /// that is said in one line rather than shown as an empty list.
+    @objc private func showContents() {
+        guard let document = pdfView.document else { return }
+        guard OutlineViewController.hasOutline(document) else {
+            let alert = UIAlertController(
+                title: "No table of contents",
+                message: "This PDF carries no outline. The bookmark still works.",
+                preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+            return
+        }
+        let current = pdfView.currentPage.map { document.index(for: $0) } ?? 0
+        let vc = OutlineViewController(document: document, currentPage: current)
+        vc.onSelect = { [weak self] index in self?.goToPage(index) }
+        let nav = UINavigationController(rootViewController: vc)
+        nav.modalPresentationStyle = .formSheet
+        present(nav, animated: true)
+    }
+
+    private func goToPage(_ index: Int) {
+        guard let document = pdfView.document,
+              index >= 0, index < document.pageCount,
+              let page = document.page(at: index) else { return }
+        pdfView.go(to: page)
+    }
+
+    /// One bookmark per paper. Tapping it on the bookmarked page removes it;
+    /// tapping it anywhere else offers to jump there or move it here. The
+    /// saved *position* is separate and automatic -- this is the deliberate
+    /// "come back to this" mark, which reading position cannot be because it
+    /// moves every time you check a reference.
+    @objc private func bookmarkTapped() {
+        guard let document = pdfView.document, let page = pdfView.currentPage else { return }
+        let here = document.index(for: page)
+        let existing = Store.shared.bookmark(for: paper.key)
+
+        guard let marked = existing, marked != here else {
+            // No bookmark, or the bookmark is this page: toggle.
+            Store.shared.setBookmark(paper.key, page: existing == nil ? here : nil)
+            refreshBookmarkButton()
+            return
+        }
+
+        let sheet = UIAlertController(title: "Bookmark on p. \(marked + 1)",
+                                      message: nil, preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Go to p. \(marked + 1)", style: .default) { _ in
+            self.goToPage(marked)
+        })
+        sheet.addAction(UIAlertAction(title: "Move bookmark to p. \(here + 1)",
+                                      style: .default) { _ in
+            Store.shared.setBookmark(self.paper.key, page: here)
+            self.refreshBookmarkButton()
+        })
+        sheet.addAction(UIAlertAction(title: "Remove bookmark", style: .destructive) { _ in
+            Store.shared.setBookmark(self.paper.key, page: nil)
+            self.refreshBookmarkButton()
+        })
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        // An action sheet on iPad is a popover and must be anchored, or it
+        // throws at presentation time.
+        sheet.popoverPresentationController?.barButtonItem = bookmarkButton
+        present(sheet, animated: true)
+    }
+
+    /// The button says where the bookmark is, and whether you are on it.
+    private func refreshBookmarkButton() {
+        guard let marked = Store.shared.bookmark(for: paper.key) else {
+            bookmarkButton?.title = "🔖"
+            return
+        }
+        var here: Int?
+        if let page = pdfView.currentPage, let document = pdfView.document {
+            here = document.index(for: page)
+        }
+        bookmarkButton?.title = here == marked ? "🔖 ●" : "🔖 p.\(marked + 1)"
     }
 
     /// Feedback about the app, tagged with the paper in hand.
@@ -350,32 +523,65 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             highlight.color = colour
             page.addAnnotation(highlight)
         }
-        // Written once, after all of them -- saving per line would rewrite the
-        // whole document for every line of a long selection.
-        saveDocument()
+        // Not written back into the PDF. Until 0.8 every highlight ended with
+        // `document.write(to:)` -- a full rewrite of the file, on the main
+        // thread, which on an A7 with a 300-page textbook is the ten-second
+        // freeze reported as "save is slow". The burnt-in copy was never used:
+        // sync sends JSON, not the PDF, and the vault writes the highlights
+        // into Zotero's copy from the stored quad points. So the highlight is
+        // drawn in memory now and replayed from annotations.json on open,
+        // which also means it survives an offload and a re-download.
     }
 
-    /// Persists the PDF itself, so the annotated file is what syncs back to the
-    /// Zotero attachment -- same as the GoodReader flow, minus the round trip.
-    private func saveDocument() {
-        guard let document = pdfView.document else { return }
-        document.write(to: Store.shared.localURL(for: paper))
-    }
-
+    /// Paint the stored highlights back onto the freshly loaded document.
+    ///
+    /// PDFs annotated by builds before 0.8 already carry their highlights
+    /// burnt in; those are detected by bounds and not drawn twice, or every
+    /// old highlight would darken on each open.
     private func restoreExistingAnnotations(into document: PDFDocument) {
-        // Highlights live in the PDF itself once drawn, so nothing to replay.
-        // This hook exists for annotations that arrive from the laptop --
-        // a paper read partly on the desktop and finished here.
-        _ = document
+        let mine = Store.shared.annotations(for: paper.key)
+        guard !mine.isEmpty else { return }
+        for annotation in mine {
+            guard annotation.pageIndex >= 0, annotation.pageIndex < document.pageCount,
+                  let page = document.page(at: annotation.pageIndex) else { continue }
+            let hasComment = !annotation.comment.isEmpty || annotation.voiceNote != nil
+            let already: [CGRect] = page.annotations
+                .filter { $0.type == "Highlight" }
+                .map { $0.bounds }
+            var missing: [[Double]] = []
+            for q in annotation.quadPoints where q.count >= 4 {
+                let rect = CGRect(x: CGFloat(q[0]), y: CGFloat(q[1]),
+                                  width: CGFloat(q[2]), height: CGFloat(q[3]))
+                var found = false
+                for b in already {
+                    let dx: CGFloat = abs(b.origin.x - rect.origin.x)
+                    let dy: CGFloat = abs(b.origin.y - rect.origin.y)
+                    let dw: CGFloat = abs(b.size.width - rect.size.width)
+                    let dh: CGFloat = abs(b.size.height - rect.size.height)
+                    if dx < 1 && dy < 1 && dw < 1 && dh < 1 {
+                        found = true
+                        break
+                    }
+                }
+                if !found { missing.append(q) }
+            }
+            if !missing.isEmpty {
+                drawHighlight(quads: missing, on: page, hasComment: hasComment)
+            }
+        }
     }
 
     // MARK: - Rep bookkeeping
 
     private func finishRep() {
         rep.endedAt = Date()
+        rep.elapsedSeconds = timerView.sessionElapsed
         Store.shared.updateLatestRep { current in
             current.endedAt = self.rep.endedAt
             current.annotationCount = self.rep.annotationCount
+            // This sitting alone, pauses excluded. Not the cumulative figure
+            // on screen -- that would count the earlier sittings twice.
+            current.elapsedSeconds = self.rep.elapsedSeconds
         }
         // Flush on the way out rather than on a button. If the laptop is not
         // reachable, this fails quietly and the next flush picks it up.
@@ -410,16 +616,15 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     private var positionKey: String { return "position-" + paper.key }
 
     private func restorePosition() {
-        let saved = UserDefaults.standard.integer(forKey: positionKey)
+        // The store is written on every page turn; the UserDefaults key is
+        // what builds before 0.8 wrote on the way out, kept so an upgrade
+        // does not open every paper at page one.
+        let saved = Store.shared.progress(for: paper.key)?.page
+            ?? UserDefaults.standard.integer(forKey: positionKey)
         guard saved > 0, let document = pdfView.document,
               saved < document.pageCount, let page = document.page(at: saved) else { return }
         pdfView.go(to: page)
-    }
-
-    override func viewDidDisappear(_ animated: Bool) {
-        super.viewDidDisappear(animated)
-        guard let page = pdfView.currentPage, let document = pdfView.document else { return }
-        UserDefaults.standard.set(document.index(for: page), forKey: positionKey)
+        pageChanged()
     }
 
     private func showMissingFile() {

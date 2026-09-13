@@ -35,6 +35,22 @@ final class RepTimerView: UIView {
     /// Target duration in seconds; nil for an untimed read (still counts up).
     var target: TimeInterval?
 
+    /// Seconds spent on this paper in earlier sittings.
+    ///
+    /// The plan's budget is for the document, not the sitting, so the digits,
+    /// the fill and the guide's arc all continue from here rather than from
+    /// zero. What the rep log records is `sessionElapsed` -- this sitting alone
+    /// -- so carrying time forward on screen never double-counts it in the
+    /// training record. Set before `start()`.
+    var carried: TimeInterval = 0 {
+        didSet {
+            // Reaching the target in a previous sitting is old news; announce
+            // only a crossing that happens in this one.
+            if let t = target, t > 0, carried >= t { announced = true }
+            updateLabel()
+        }
+    }
+
     /// Fired once when the target is reached. The rep does not stop -- running
     /// over is a legitimate choice, and being ejected from a paper mid-argument
     /// would be worse than the overrun.
@@ -161,10 +177,15 @@ final class RepTimerView: UIView {
         isRunning ? pause() : start()
     }
 
-    var elapsed: TimeInterval {
+    /// This sitting only. The number the rep log is told.
+    var sessionElapsed: TimeInterval {
         guard let started = startedAt else { return accumulated }
         return accumulated + Date().timeIntervalSince(started)
     }
+
+    /// Cumulative for the paper: earlier sittings plus this one. What the
+    /// digits show and what the target is measured against.
+    var elapsed: TimeInterval { return carried + sessionElapsed }
 
     var elapsedMinutes: Int { return Int((elapsed / 60).rounded()) }
 

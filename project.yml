@@ -58,8 +58,8 @@ targets:
         # Bump BOTH on every build that gets sideloaded. The library screen
         # shows them, and that footer is the only way to tell two sideloaded
         # builds apart -- there is no App Store version to check against.
-        CFBundleShortVersionString: "0.7"
-        CFBundleVersion: "7"
+        CFBundleShortVersionString: "0.8"
+        CFBundleVersion: "8"
         UILaunchStoryboardName: ""
         # All four, because iPad multitasking requires either the full set or
         # UIRequiresFullScreen -- and a reader that refuses an orientation

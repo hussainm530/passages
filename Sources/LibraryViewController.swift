@@ -219,7 +219,19 @@ final class LibraryViewController: UITableViewController {
             parts.append("on laptop")
         }
         if count > 0 { parts.append("\(count) annotation\(count == 1 ? "" : "s")") }
-        if let minutes = paper.repMinutes { parts.append("\(minutes) min rep") }
+        // Where you are and how long you have spent, so the list answers
+        // "which one was I in the middle of" without opening anything. Both
+        // come from the device's own record: the position is written on
+        // every page turn, the minutes are the sum of every sitting so far.
+        if let p = Store.shared.progress(for: paper.key), p.pageCount > 0, p.page > 0 {
+            parts.append("p. \(p.page + 1)/\(p.pageCount)")
+        }
+        let spent = Int((Store.shared.priorElapsed(for: paper.key) / 60).rounded())
+        if let minutes = paper.repMinutes {
+            parts.append(spent > 0 ? "\(spent)/\(minutes) min" : "\(minutes) min rep")
+        } else if spent > 0 {
+            parts.append("\(spent) min read")
+        }
 
         cell.detailTextLabel?.text = parts.joined(separator: " · ")
         cell.detailTextLabel?.font = UIFont.systemFont(ofSize: 12)

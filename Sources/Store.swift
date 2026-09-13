@@ -20,6 +20,8 @@ final class Store {
     private let deepReadsFile: URL
     private let guideNotesFile: URL
     private let readFile: URL
+    private let bookmarksFile: URL
+    private let progressFile: URL
 
     private(set) var papers: [Paper] = []
     private(set) var annotations: [Annotation] = []
@@ -32,6 +34,12 @@ final class Store {
     /// Paper key -> read. Its own file for the same reason deep-reads are:
     /// papers.json is replaced wholesale on every library refresh.
     private var readFlags: [String: Bool] = [:]
+    /// Paper key -> zero-based page index of the one bookmark a paper gets.
+    private var bookmarks: [String: Int] = [:]
+    /// Paper key -> where the reader last was, and how long the document is.
+    /// Read by the library to show "p. 41 of 380" without opening the PDF,
+    /// which on this hardware is the expensive part.
+    private var progressByPaper: [String: ReadingProgress] = [:]
 
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -56,6 +64,8 @@ final class Store {
         deepReadsFile = root.appendingPathComponent("deep_reads.json")
         guideNotesFile = root.appendingPathComponent("guide_notes.json")
         readFile = root.appendingPathComponent("read.json")
+        bookmarksFile = root.appendingPathComponent("bookmarks.json")
+        progressFile = root.appendingPathComponent("progress.json")
 
         for dir in [pdfDir, voiceDir] {
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -72,6 +82,8 @@ final class Store {
         deepReads = decodeFile(deepReadsFile) ?? [:]
         guideNotes = decodeFile(guideNotesFile) ?? []
         readFlags = decodeFile(readFile) ?? [:]
+        bookmarks = decodeFile(bookmarksFile) ?? [:]
+        progressByPaper = decodeFile(progressFile) ?? [:]
     }
 
     private func decodeFile<T: Decodable>(_ url: URL) -> T? {
@@ -147,6 +159,34 @@ final class Store {
     /// stay: offloading frees space, it does not discard the work.
     func offload(_ paper: Paper) {
         try? fm.removeItem(at: localURL(for: paper))
+    }
+
+    // MARK: - Bookmark and progress
+
+    func bookmark(for paperKey: String) -> Int? { return bookmarks[paperKey] }
+
+    /// One bookmark per paper, deliberately. It answers "where was I going to
+    /// pick this up" -- a second one would turn it into a highlight system,
+    /// which the annotations already are.
+    func setBookmark(_ paperKey: String, page: Int?) {
+        if let page = page { bookmarks[paperKey] = page } else { bookmarks[paperKey] = nil }
+        write(bookmarks, to: bookmarksFile)
+    }
+
+    func progress(for paperKey: String) -> ReadingProgress? {
+        return progressByPaper[paperKey]
+    }
+
+    /// Recorded on every page change rather than only on the way out.
+    /// `viewDidDisappear` never runs when the app is killed from the switcher
+    /// or the battery dies, and that is exactly how a 300-page textbook forgets
+    /// where you were.
+    func setProgress(_ paperKey: String, page: Int, pageCount: Int) {
+        let current = progressByPaper[paperKey]
+        // A no-op write is still a file write; skip it when nothing moved.
+        if current?.page == page && current?.pageCount == pageCount { return }
+        progressByPaper[paperKey] = ReadingProgress(page: page, pageCount: pageCount)
+        write(progressByPaper, to: progressFile)
     }
 
     // MARK: - Guide notes
@@ -245,6 +285,30 @@ final class Store {
         write(reps, to: repsFile)
     }
 
+    /// Seconds already spent on a paper in earlier sittings.
+    ///
+    /// The timer used to restart at zero every time a paper opened, so a
+    /// 60-minute plan read across three evenings showed 0:00 three times and
+    /// the arc never got past chunk 2. The plan's budget is for the *document*,
+    /// not the sitting, so the clock has to carry over.
+    ///
+    /// Prefers the timer's own count, which excludes pauses and the screen
+    /// being locked; falls back to the wall-clock span for reps written by
+    /// builds that did not record it. Open-ended reps (no `endedAt`) are
+    /// skipped: that is a session that never closed cleanly, and its span
+    /// would be whatever time the crash happened to leave behind.
+    func priorElapsed(for paperKey: String) -> TimeInterval {
+        var total: TimeInterval = 0
+        for rep in reps where rep.paperKey == paperKey {
+            if let seconds = rep.elapsedSeconds {
+                total += max(0, seconds)
+            } else if let ended = rep.endedAt {
+                total += max(0, ended.timeIntervalSince(rep.startedAt))
+            }
+        }
+        return total
+    }
+
     func updateLatestRep(_ transform: (inout Rep) -> Void) {
         guard !reps.isEmpty else { return }
         transform(&reps[reps.count - 1])
@@ -259,5 +323,16 @@ final class Store {
         guard let last = lastSync else { return (annotations, reps) }
         return (annotations.filter { $0.createdAt > last },
                 reps.filter { $0.startedAt > last })
+    }
+}
+
+/// Where a paper was left, for the library row and for reopening in place.
+struct ReadingProgress: Codable {
+    let page: Int
+    let pageCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case page
+        case pageCount = "page_count"
     }
 }

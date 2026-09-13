@@ -175,11 +175,18 @@ struct Rep: Codable {
     let startedAt: Date
     var endedAt: Date?
     var annotationCount: Int
+    /// Seconds the timer actually ran -- pauses and the screen being locked
+    /// excluded. `ended_at - started_at` is the wall-clock span and counts
+    /// the lunch break; this is what the timer showed. Optional so reps
+    /// written by older builds still decode. The vault's rep log prefers
+    /// this when present, and the cumulative per-paper clock is built from it.
+    var elapsedSeconds: TimeInterval?
 
     enum CodingKeys: String, CodingKey {
         case paperKey = "paper_key"
         case startedAt = "started_at"
         case endedAt = "ended_at"
         case annotationCount = "annotation_count"
+        case elapsedSeconds = "elapsed_seconds"
     }
 }

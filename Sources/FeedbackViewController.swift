@@ -12,11 +12,12 @@ import UIKit
 /// under `## Open` in `_reader-app-feedback.md`, where the next session picks
 /// it up. Nothing to file, nothing to route.
 ///
-/// Deliberately not offline-first, unlike annotations. An annotation is the
-/// reader's irreplaceable work and must survive a dead tailnet; a note about a
-/// button is worth exactly one honest attempt, and pretending otherwise would
-/// mean a queue, a flush, and a retry path for the least valuable payload in
-/// the app. If it cannot send, it says so and keeps what was typed.
+/// Offline-first since 0.8. It was deliberately not -- "a note about a button
+/// is worth exactly one honest attempt" -- and the reader's own feedback on
+/// 10 Sept 2026 was that the attempt fails often enough, on campus wifi and
+/// the train, that the note gets typed and then dropped. It now rides the same
+/// unsent-writes queue as reads and offloads: if it cannot send, it is kept on
+/// the device and goes on the next sync, and the screen says which happened.
 final class FeedbackViewController: UIViewController {
 
     private let textView = UITextView()
@@ -102,12 +103,15 @@ final class FeedbackViewController: UIViewController {
                 self.dismiss(animated: true)
                 return
             }
-            // Keep the text. Retyping a complaint is how a complaint stops
-            // being reported.
-            self.sendButton.isEnabled = true
-            self.status.textColor = UIColor(red: 0.7, green: 0.2, blue: 0.15, alpha: 1)
-            self.status.text = "Couldn't reach the laptop — nothing was sent. "
-                + "Your text is still here; try again when the tailnet is up."
+            // Not lost: it is in the pending-writes queue and goes with the
+            // next sync. Say so, then get out of the way -- the reader was
+            // mid-paper.
+            self.status.textColor = UIColor(red: 0.72, green: 0.45, blue: 0.0, alpha: 1)
+            self.status.text = "Couldn't reach the laptop — saved on the iPad. "
+                + "It will go on the next sync."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                self?.dismiss(animated: true)
+            }
         }
     }
 }

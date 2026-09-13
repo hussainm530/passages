@@ -254,27 +254,25 @@ final class SyncClient {
 
     /// Send an observation about the app itself to the vault backlog.
     ///
-    /// Not fire-and-forget, unlike everything else here. The rest of this class
-    /// can afford silent failure because the device keeps its own copy and a
-    /// later flush re-sends -- feedback has no local store and no retry, so a
-    /// dropped one is simply gone. The caller is told, and can decide.
+    /// Kept if it does not land. This was deliberately one honest attempt
+    /// until 0.8 -- "a note about a button is worth exactly one try" -- and
+    /// the reader's own feedback on 10 Sept was that the tailnet is down
+    /// often enough (campus wifi, the train) that the note gets typed, fails,
+    /// and is abandoned. So it rides the same unsent-writes queue as reads and
+    /// offloads, and goes on the next sync. The caller is told whether it went
+    /// now or later.
     ///
     /// The server appends it under `## Open` in `_reader-app-feedback.md`, or
     /// queues it when the serving node is not the one that owns the vault.
     func sendFeedback(text: String, paper: String?,
                       completion: @escaping (Bool) -> Void) {
-        guard var request = jsonRequest(path: "api/feedback") else {
-            completion(false)
-            return
-        }
-        var body: [String: Any] = ["text": text]
+        // An id, so two pieces of feedback are two rows in the queue rather
+        // than one overwriting the other -- the queue dedupes on it.
+        var body: [String: Any] = ["text": text, "id": UUID().uuidString]
         if let paper = paper, !paper.isEmpty { body["paper"] = paper }
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        session.dataTask(with: request) { _, response, _ in
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            DispatchQueue.main.async { completion(code == 200) }
-        }.resume()
+        post(path: "api/feedback", body: body) { landed in
+            DispatchQueue.main.async { completion(landed) }
+        }
     }
 
     /// Tell the laptop this paper is (or is no longer) marked for a deep read.
@@ -350,18 +348,29 @@ final class SyncClient {
         }
     }
 
-    private static func matches(_ item: [String: Any],
-                                _ path: String, _ paperKey: String) -> Bool {
-        let body = item["body"] as? [String: Any]
-        return (item["path"] as? String) == path
-            && (body?["paper_key"] as? String) == paperKey
+    /// Identity of a queued write: (path, id) when the body carries an id,
+    /// else (path, paper_key). Reads and offloads are one-per-paper and the
+    /// later one wins; feedback has no paper and every piece is its own row.
+    private static func identity(_ path: String, _ body: [String: Any]) -> String {
+        let key = (body["id"] as? String) ?? (body["paper_key"] as? String) ?? ""
+        return path + "|" + key
+    }
+
+    private static func matches(_ item: [String: Any], _ identity: String) -> Bool {
+        guard let path = item["path"] as? String,
+              let body = item["body"] as? [String: Any] else { return false }
+        return SyncClient.identity(path, body) == identity
     }
 
     /// Send a write, and keep it if it does not arrive.
-    private func post(path: String, body: [String: Any]) {
-        guard var request = jsonRequest(path: path) else { return }
+    private func post(path: String, body: [String: Any],
+                      completion: ((Bool) -> Void)? = nil) {
+        guard var request = jsonRequest(path: path) else {
+            completion?(false)
+            return
+        }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        let paperKey = (body["paper_key"] as? String) ?? ""
+        let identity = SyncClient.identity(path, body)
         session.dataTask(with: request) { [weak self] _, response, error in
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             let landed = error == nil && (200..<300).contains(code)
@@ -370,11 +379,12 @@ final class SyncClient {
             // transport failure or a 5xx is worth keeping.
             let worthRetrying = error != nil || code >= 500 || code == 0
             self?.mutatePending { items in
-                items.removeAll { SyncClient.matches($0, path, paperKey) }
+                items.removeAll { SyncClient.matches($0, identity) }
                 if !landed && worthRetrying {
                     items.append(["path": path, "body": body])
                 }
             }
+            completion?(landed)
         }.resume()
     }
 
