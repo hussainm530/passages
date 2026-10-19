@@ -31,6 +31,8 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
 
     /// Single tap on a highlight -> its comment. See `highlightTapped`.
     private let highlightTap = UITapGestureRecognizer()
+    /// The highlight a follow-up comment is being written against, if any.
+    private var followUpRoot: Annotation?
 
     init(paper: Paper) {
         self.paper = paper
@@ -247,6 +249,9 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         composer.prepareMicrophone()
         composer.onSave = { [weak self] comment, category, voice in
             self?.saveAnnotation(comment: comment, category: category, voice: voice)
+        }
+        composer.onSaveFollowUp = { [weak self] comment, voice in
+            self?.saveFollowUp(comment: comment, voice: voice)
         }
         composer.onSaveNote = { [weak self] text, voice in
             guard let self = self, let chunk = self.noteChunk else { return }
@@ -541,9 +546,7 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         // Colour carries no meaning -- categories come from the comment, per
         // the vault's scheme. Commented highlights are simply darker so they
         // are findable on a re-skim.
-        let colour = hasComment
-            ? UIColor(red: 0.95, green: 0.75, blue: 0.3, alpha: 1)
-            : UIColor(red: 0.99, green: 0.9, blue: 0.55, alpha: 1)
+        let colour = highlightColour(hasComment: hasComment)
         for q in quads where q.count >= 4 {
             let x: CGFloat = CGFloat(q[0])
             let y: CGFloat = CGFloat(q[1])
@@ -573,10 +576,17 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     private func restoreExistingAnnotations(into document: PDFDocument) {
         let mine = Store.shared.annotations(for: paper.key)
         guard !mine.isEmpty else { return }
+        // Follow-ups are not drawn: they sit on the original's geometry, and
+        // they only contribute to whether the original reads as commented.
+        var followedUp = Set<String>()
         for annotation in mine {
+            if let root = annotation.replyTo { followedUp.insert(root) }
+        }
+        for annotation in mine where annotation.replyTo == nil {
             guard annotation.pageIndex >= 0, annotation.pageIndex < document.pageCount,
                   let page = document.page(at: annotation.pageIndex) else { continue }
             let hasComment = !annotation.comment.isEmpty || annotation.voiceNote != nil
+                || followedUp.contains(annotation.id)
             let already: [CGRect] = page.annotations
                 .filter { $0.type == "Highlight" }
                 .map { $0.bounds }
@@ -600,19 +610,25 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             if !missing.isEmpty {
                 drawHighlight(quads: missing, on: page, hasComment: hasComment)
             }
+            // A burnt-in highlight from before 0.8 keeps its old colour unless
+            // told otherwise -- and a follow-up is exactly that telling.
+            if followedUp.contains(annotation.id) {
+                recolour(quads: annotation.quadPoints, on: page, hasComment: true)
+            }
         }
     }
 
     // MARK: - Reading back a highlight
 
-    /// Show the comment, category and voice note behind a tapped highlight.
+    /// Show the comment, category and voice note behind a tapped highlight,
+    /// with any comments added to it since.
     ///
-    /// Read-only on purpose. An edit made here would not reach the vault: the
-    /// app only resends annotations *created* since the last sync, and both
-    /// `reader_server.py` and `ipad_inbox.py` dedupe by id keeping the first
-    /// version seen. Editing needs an `updated_at` carried end to end first --
-    /// until then a sheet that offered it would let the device and the
-    /// literature note quietly disagree.
+    /// Earlier comments are read-only on purpose. An edit would not reach the
+    /// vault: the app only resends annotations *created* since the last sync,
+    /// and both `reader_server.py` and `ipad_inbox.py` dedupe by id keeping the
+    /// first version seen. Adding is different -- a follow-up is a new record
+    /// with its own id (`replyTo` points at the original), so it syncs exactly
+    /// like a fresh highlight and the vault nests it under the original.
     @objc private func highlightTapped(_ gesture: UITapGestureRecognizer) {
         // A tap while text is selected is the reader adjusting or dismissing
         // the selection, not asking about a highlight.
@@ -628,8 +644,10 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         // Overlapping highlights: the newest wins, being the one drawn on top.
         var hit: Annotation?
         var hitRect = CGRect.zero
+        // Follow-ups share the original's geometry; resolving to the original
+        // keeps a tap from opening a single later comment on its own.
         for annotation in Store.shared.annotations(for: paper.key)
-        where annotation.pageIndex == index {
+        where annotation.pageIndex == index && annotation.replyTo == nil {
             for q in annotation.quadPoints where q.count >= 4 {
                 let rect = CGRect(x: CGFloat(q[0]), y: CGFloat(q[1]),
                                   width: CGFloat(q[2]), height: CGFloat(q[3]))
@@ -655,28 +673,102 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         var quote = annotation.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if quote.count > 280 { quote = String(quote.prefix(280)) + "…" }
 
-        var parts = ["“" + quote + "”"]
-        parts.append(annotation.comment.isEmpty ? "No comment." : annotation.comment)
-        if let voice = annotation.voiceNote {
+        let f = DateFormatter()
+        f.dateFormat = "d MMM, HH:mm"
+        func voiceLine(_ voice: String) -> String {
             var line = "🎙 voice note"
             if let at = Store.shared.voiceRecordedAt(voice) {
-                let f = DateFormatter()
-                f.dateFormat = "d MMM, HH:mm"
                 line += " · " + f.string(from: at)
             }
             if !Store.shared.voiceExists(voice) { line += " · FILE MISSING" }
-            parts.append(line)
+            return line
+        }
+
+        var parts = ["“" + quote + "”"]
+        parts.append(annotation.comment.isEmpty ? "No comment." : annotation.comment)
+        if let voice = annotation.voiceNote { parts.append(voiceLine(voice)) }
+        for later in Store.shared.followUps(to: annotation.id) {
+            var block = "Added " + f.string(from: later.createdAt) + ":"
+            if !later.comment.isEmpty { block += "\n" + later.comment }
+            if let voice = later.voiceNote { block += "\n" + voiceLine(voice) }
+            parts.append(block)
         }
 
         let sheet = UIAlertController(title: "\(category) · p. \(journalPage)",
                                       message: parts.joined(separator: "\n\n"),
                                       preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Add comment", style: .default) { _ in
+            self.followUpRoot = annotation
+            self.composer.presentFollowUp(quote: quote)
+        })
         sheet.addAction(UIAlertAction(title: "Done", style: .cancel))
         // An action sheet on iPad is a popover and must be anchored, or it
         // throws at presentation time.
         sheet.popoverPresentationController?.sourceView = pdfView
         sheet.popoverPresentationController?.sourceRect = anchor
         present(sheet, animated: true)
+    }
+
+    /// A later comment on an existing highlight, stored as its own record.
+    ///
+    /// Same passage, page and geometry as the original, a new id, and
+    /// `replyTo` naming the original -- so it is "created since the last
+    /// sync" and goes out with the next push like any new highlight.
+    private func saveFollowUp(comment: String, voice: String?) {
+        guard let root = followUpRoot else { return }
+        followUpRoot = nil
+        guard !comment.isEmpty || voice != nil else { return }
+
+        var followUp = Annotation(
+            id: UUID().uuidString,
+            paperKey: paper.key,
+            pageIndex: root.pageIndex,
+            text: root.text,
+            comment: comment,
+            category: root.category,
+            voiceNote: voice,
+            createdAt: Date(),
+            quadPoints: root.quadPoints
+        )
+        followUp.replyTo = root.id
+
+        Store.shared.add(followUp)
+        rep.annotationCount += 1
+        Store.shared.updateLatestRep { $0.annotationCount = self.rep.annotationCount }
+
+        // A bare highlight that now has something said about it should look
+        // like one, or it stops being findable on a re-skim.
+        if let page = pdfView.document?.page(at: root.pageIndex) {
+            recolour(quads: root.quadPoints, on: page, hasComment: true)
+        }
+
+        SyncClient.shared.push(followUp)
+    }
+
+    private func highlightColour(hasComment: Bool) -> UIColor {
+        return hasComment
+            ? UIColor(red: 0.95, green: 0.75, blue: 0.3, alpha: 1)
+            : UIColor(red: 0.99, green: 0.9, blue: 0.55, alpha: 1)
+    }
+
+    /// Repaint the highlights already drawn for `quads`, matched by bounds the
+    /// same way `restoreExistingAnnotations` matches burnt-in ones.
+    private func recolour(quads: [[Double]], on page: PDFPage, hasComment: Bool) {
+        let colour = highlightColour(hasComment: hasComment)
+        for q in quads where q.count >= 4 {
+            let rect = CGRect(x: CGFloat(q[0]), y: CGFloat(q[1]),
+                              width: CGFloat(q[2]), height: CGFloat(q[3]))
+            for existing in page.annotations where existing.type == "Highlight" {
+                let b = existing.bounds
+                let dx: CGFloat = abs(b.origin.x - rect.origin.x)
+                let dy: CGFloat = abs(b.origin.y - rect.origin.y)
+                let dw: CGFloat = abs(b.size.width - rect.size.width)
+                let dh: CGFloat = abs(b.size.height - rect.size.height)
+                if dx < 1 && dy < 1 && dw < 1 && dh < 1 {
+                    existing.color = colour
+                }
+            }
+        }
     }
 
     // MARK: - Rep bookkeeping

@@ -154,6 +154,13 @@ struct Annotation: Codable {
     /// tags its own records `quad_origin: "top-left"` and treats the absence of
     /// that field as "this came from PDFKit", which is what these are.
     let quadPoints: [[Double]]
+    /// Set when this record is a later comment on an existing highlight: the
+    /// `id` of the original. The follow-up copies the original's passage and
+    /// geometry but is its own record with its own id, so it travels the sync
+    /// as a brand-new annotation. That is the point -- the server and the
+    /// vault dedupe by id keeping the first version, so editing the original
+    /// in place would never arrive, while adding beside it always does.
+    var replyTo: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, text, comment, category
@@ -162,6 +169,7 @@ struct Annotation: Codable {
         case voiceNote = "voice_note"
         case createdAt = "created_at"
         case quadPoints = "quad_points"
+        case replyTo = "reply_to"
     }
 }
 

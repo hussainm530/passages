@@ -262,6 +262,13 @@ final class Store {
             .sorted { $0.pageIndex < $1.pageIndex }
     }
 
+    /// Later comments added to the highlight `rootId`, oldest first.
+    func followUps(to rootId: String) -> [Annotation] {
+        return annotations
+            .filter { $0.replyTo == rootId }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
     func add(_ annotation: Annotation) {
         annotations.append(annotation)
         write(annotations, to: annotationsFile)

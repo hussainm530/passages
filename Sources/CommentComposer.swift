@@ -60,6 +60,12 @@ final class CommentComposer: UIView, UITextViewDelegate {
     var onVoiceCaptured: ((String) -> Void)?
     private var isNoteMode = false
 
+    /// Called instead of `onSave` when the composer was opened to add a
+    /// comment to an existing highlight. No category: the follow-up files
+    /// under the original's.
+    var onSaveFollowUp: ((String, String?) -> Void)?
+    private var isFollowUpMode = false
+
     // MARK: - Setup
 
     override init(frame: CGRect) {
@@ -284,6 +290,7 @@ final class CommentComposer: UIView, UITextViewDelegate {
     /// anything had been captured -- or to remove a bad take.
     func presentNote(chunkTitle: String, existing: String, existingVoice: String? = nil) {
         isNoteMode = true
+        isFollowUpMode = false
         pendingVoiceNote = existingVoice
         // Adopted, not made here. Re-recording may replace a take from this
         // sitting; it may not destroy one the reader made days ago.
@@ -300,8 +307,31 @@ final class CommentComposer: UIView, UITextViewDelegate {
         textView.becomeFirstResponder()
     }
 
+    /// Open to add a further comment to a highlight that already exists.
+    ///
+    /// Starts empty rather than showing the earlier comment for editing: the
+    /// earlier one has already gone to the vault and cannot be changed there,
+    /// so what this writes is an addition beside it.
+    func presentFollowUp(quote: String) {
+        isNoteMode = false
+        isFollowUpMode = true
+        chipRow.isHidden = true
+        pendingVoiceNote = nil
+        capturedThisSitting = false
+        recordingLabel.isHidden = true
+        quoteLabel.text = "Add to “" + quote.trimmingCharacters(in: .whitespacesAndNewlines) + "”"
+        textView.text = ""
+        selectedCategory = nil
+        refreshVoiceChip()
+        isHidden = false
+        // Raised, unlike a fresh highlight: the only reason to be here is to
+        // say something.
+        textView.becomeFirstResponder()
+    }
+
     func present(quote: String) {
         isNoteMode = false
+        isFollowUpMode = false
         chipRow.isHidden = false
         pendingVoiceNote = nil
         capturedThisSitting = false
@@ -470,6 +500,8 @@ final class CommentComposer: UIView, UITextViewDelegate {
         let comment = textView.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if isNoteMode {
             onSaveNote?(comment, pendingVoiceNote)
+        } else if isFollowUpMode {
+            onSaveFollowUp?(comment, pendingVoiceNote)
         } else {
             onSave?(comment, selectedCategory, pendingVoiceNote)
         }
