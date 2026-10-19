@@ -29,6 +29,9 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
     /// missing bookmark. Done once, on the first real layout.
     private var restoredPosition = false
 
+    /// Single tap on a highlight -> its comment. See `highlightTapped`.
+    private let highlightTap = UITapGestureRecognizer()
+
     init(paper: Paper) {
         self.paper = paper
         self.rep = Rep(paperKey: paper.key, startedAt: Date(),
@@ -83,6 +86,26 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
               pdfView.document != nil else { return }
         restoredPosition = true
         restorePosition()
+        deferToDoubleTaps()
+    }
+
+    /// Let PDFView's double-tap zoom win over the highlight tap.
+    ///
+    /// Without this the first tap of a double-tap on a highlight opens the
+    /// comment sheet while the page zooms underneath it. PDFKit installs its
+    /// recognizers on internal subviews once the document has laid out, which
+    /// is why this runs here and not in `setUpPDFView`.
+    private func deferToDoubleTaps() {
+        var stack: [UIView] = [pdfView]
+        while let v = stack.popLast() {
+            for g in v.gestureRecognizers ?? [] {
+                if let tap = g as? UITapGestureRecognizer, tap !== highlightTap,
+                   tap.numberOfTapsRequired > 1 {
+                    highlightTap.require(toFail: tap)
+                }
+            }
+            stack.append(contentsOf: v.subviews)
+        }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -148,6 +171,15 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
             self, selector: #selector(pageChanged),
             name: .PDFViewPageChanged, object: pdfView)
         pageChanged()
+
+        // Tapping a highlight shows what was said about it. Hit-tested against
+        // the stored quad points rather than PDFKit's own annotation-hit
+        // notification, which on iOS reliably fires for links and not for
+        // highlights -- and the store is the record anyway, not the drawing.
+        highlightTap.addTarget(self, action: #selector(highlightTapped(_:)))
+        highlightTap.cancelsTouchesInView = false
+        highlightTap.delegate = self
+        pdfView.addGestureRecognizer(highlightTap)
     }
 
     /// Keep the bar, the label and the saved position in step with the page.
@@ -571,6 +603,82 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
         }
     }
 
+    // MARK: - Reading back a highlight
+
+    /// Show the comment, category and voice note behind a tapped highlight.
+    ///
+    /// Read-only on purpose. An edit made here would not reach the vault: the
+    /// app only resends annotations *created* since the last sync, and both
+    /// `reader_server.py` and `ipad_inbox.py` dedupe by id keeping the first
+    /// version seen. Editing needs an `updated_at` carried end to end first --
+    /// until then a sheet that offered it would let the device and the
+    /// literature note quietly disagree.
+    @objc private func highlightTapped(_ gesture: UITapGestureRecognizer) {
+        // A tap while text is selected is the reader adjusting or dismissing
+        // the selection, not asking about a highlight.
+        if let s = pdfView.currentSelection?.string,
+           !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+
+        let location = gesture.location(in: pdfView)
+        guard let document = pdfView.document,
+              let page = pdfView.page(for: location, nearest: false) else { return }
+        let point = pdfView.convert(location, to: page)
+        let index = document.index(for: page)
+
+        // Overlapping highlights: the newest wins, being the one drawn on top.
+        var hit: Annotation?
+        var hitRect = CGRect.zero
+        for annotation in Store.shared.annotations(for: paper.key)
+        where annotation.pageIndex == index {
+            for q in annotation.quadPoints where q.count >= 4 {
+                let rect = CGRect(x: CGFloat(q[0]), y: CGFloat(q[1]),
+                                  width: CGFloat(q[2]), height: CGFloat(q[3]))
+                // A little slack: a line of text is about a fingertip tall.
+                guard rect.insetBy(dx: -3, dy: -3).contains(point) else { continue }
+                if hit == nil || annotation.createdAt > hit!.createdAt {
+                    hit = annotation
+                    hitRect = rect
+                }
+            }
+        }
+        guard let annotation = hit else { return }
+        let anchor = pdfView.convert(hitRect, from: page)
+        showAnnotation(annotation, from: anchor)
+    }
+
+    private func showAnnotation(_ annotation: Annotation, from anchor: CGRect) {
+        // A half-written new annotation would sit on top of the sheet.
+        composer.dismiss()
+
+        let category = annotation.category?.rawValue ?? "Note"
+        let journalPage = annotation.pageIndex + 1 + paper.pageOffset
+        var quote = annotation.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if quote.count > 280 { quote = String(quote.prefix(280)) + "…" }
+
+        var parts = ["“" + quote + "”"]
+        parts.append(annotation.comment.isEmpty ? "No comment." : annotation.comment)
+        if let voice = annotation.voiceNote {
+            var line = "🎙 voice note"
+            if let at = Store.shared.voiceRecordedAt(voice) {
+                let f = DateFormatter()
+                f.dateFormat = "d MMM, HH:mm"
+                line += " · " + f.string(from: at)
+            }
+            if !Store.shared.voiceExists(voice) { line += " · FILE MISSING" }
+            parts.append(line)
+        }
+
+        let sheet = UIAlertController(title: "\(category) · p. \(journalPage)",
+                                      message: parts.joined(separator: "\n\n"),
+                                      preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Done", style: .cancel))
+        // An action sheet on iPad is a popover and must be anchored, or it
+        // throws at presentation time.
+        sheet.popoverPresentationController?.sourceView = pdfView
+        sheet.popoverPresentationController?.sourceRect = anchor
+        present(sheet, animated: true)
+    }
+
     // MARK: - Rep bookkeeping
 
     private func finishRep() {
@@ -644,5 +752,15 @@ final class ReaderViewController: UIViewController, PDFViewDelegate {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+}
+
+extension ReaderViewController: UIGestureRecognizerDelegate {
+    /// Alongside PDFView's own gestures, never instead of them: selecting text
+    /// and scrolling must behave exactly as they did before highlights were
+    /// tappable.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        return true
     }
 }
